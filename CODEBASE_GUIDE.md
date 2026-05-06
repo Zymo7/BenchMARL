@@ -253,3 +253,46 @@ python benchmarl/run.py algorithm=mappo task=vmas/navigation task.max_steps=200 
 这样视频会同时更长（更多步）和更慢（更低帧率）。
 ```
 
+```bash
+● 从代码可以看出，navigation 任务默认没有障碍物。VMAS 的 navigation scenario 位于 pip 包中：                                                                   
+                                                                                                                                                               
+  /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py                                                         
+                                                                                                                                                               
+  如何添加障碍物                                                                                                                                               
+                                                                                                                                                               
+  方案 1：直接修改 vmas 包（简单但不推荐升级包）                                                                                                               
+                                                                                                                                                               
+  # 编辑 /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py
+                                                                                                                                                               
+  在 make_world 方法中，在添加 agents 之后、返回 world 之前添加障碍物：                                                                                        
+                                                                                                                                                               
+  # 在 self.world.add_landmark(goal) 之后添加...                                                                                                               
+                  
+  # 添加障碍物
+  obstacle = Landmark(
+      name="obstacle_1",
+      collide=True,
+      shape=Sphere(radius=0.2),  # 障碍物大小
+      color=(0.5, 0.5, 0.5),
+  )
+  world.add_landmark(obstacle)
+                                                                                                                                                               
+  方案 2：创建自定义任务（推荐）
+                                                                                                                                                               
+  BenchMARL 支持扩展任务。你可以参考 examples/extending/task/ 创建自定义 navigation 任务。
+
+  方案 3：修改 VMAS 安装目录的 scenario                                                                                                                        
+  
+  # 复制并修改
+  cp /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py \
+  # 复制并修改
+  cp /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py \
+     /your/path/custom_navigation.py
+  # 复制并修改
+  cp /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py \
+     /your/path/custom_navigation.py
+
+  # 修改后在运行命令中指定
+```
+
+
