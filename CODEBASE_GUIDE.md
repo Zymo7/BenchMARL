@@ -252,6 +252,7 @@ python benchmarl/run.py algorithm=mappo task=vmas/navigation task.max_steps=200 
                                                                                                                                                                 
 这样视频会同时更长（更多步）和更慢（更低帧率）。
 ```
+### 5. 添加障碍物 
 
 ```bash
 ● 从代码可以看出，navigation 任务默认没有障碍物。VMAS 的 navigation scenario 位于 pip 包中：                                                                   
