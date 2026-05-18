@@ -41,6 +41,7 @@ BenchMARL/
 |------|----------|------|-------------|
 | **MAPPO** | `mappo.yaml` | On-policy | 连续 + 离散 |
 | **IPPO** | `ippo.yaml` | On-policy | 连续 + 离散 |
+| **IPPO-Hebbian** | `ippo_hebbian.yaml` | On-policy | 连续 + 离散 |
 | **MADDPG** | `maddpg.yaml` | Off-policy | 连续 |
 | **IDDPG** | `iddpg.yaml` | Off-policy | 连续 |
 | **MASAC** | `masac.yaml` | Off-policy | 连续 + 离散 |
@@ -86,11 +87,39 @@ use_tanh_normal: True          # 是否使用 tanh 正态分布
 | 模型 | 说明 | 适用场景 |
 |------|------|----------|
 | **MLP** | 多层感知机 | 默认选择 |
+| **Hebbian** | 赫布学习动态层 | 在线自适应 |
 | **GRU** | 门控循环单元 | 时序依赖 |
 | **LSTM** | 长短期记忆网络 | 时序依赖 |
 | **GNN** | 图神经网络 | 多智能体通信 |
 | **CNN** | 卷积神经网络 | 视觉输入 |
 | **Deepsets** | 深集合网络 | 置换不变性 |
+
+#### IPPO-Hebbian 算法说明
+
+IPPO-Hebbian 是一种两阶段训练算法，结合了 IPPO 的策略优化和赫布学习的在线适应能力。
+
+**网络架构**：
+```
+输入 (obs_dim) → MLP1 → MLP2 → Hebbian输出层 → 动作分布
+                                    ↑
+                   ABCD 参数通过 CMA-ES 优化
+                   W 在执行过程中按 ABCD 规则在线更新
+```
+
+**赫布学习层 (Hebbian Layer)**：
+权重更新规则：$\Delta w_{ij} = A \cdot x_i \cdot y_j + B \cdot x_i + C \cdot y_j + D$
+
+其中 $x_i$ 是前层神经元激活，$y_j$ 是输出神经元激活，A、B、C、D 是每个连接的四个学习参数。
+
+**训练阶段**：
+1. **Phase 1**：用 PPO 训练前两层 MLP，Hebbian 层固定（W 保持初始值）
+2. **Phase 2**：冻结 MLP 层，用 CMA-ES 优化 Hebbian 层的 ABCD 参数
+
+**运行方式**：
+```python
+# 示例脚本
+python examples/running/run_ippo_hebbian.py
+```
 
 ### 4. experiment/ - 实验模块
 
@@ -133,12 +162,20 @@ use_tanh_normal: True          # 是否使用 tanh 正态分布
 # 运行 MAPPO + Navigation
 python benchmarl/run.py algorithm=mappo task=vmas/navigation
 
+# 运行 IPPO + Navigation
+python benchmarl/run.py algorithm=ippo task=vmas/navigation
+
+# 运行 IPPO-Hebbian（两阶段训练，需要自定义网络配置）
+python examples/running/run_ippo_hebbian.py
+
 # 运行 QMIX + SMACv2 (需要离散动作)
 python benchmarl/run.py algorithm=qmix task=smacv2/terran_5_vs_6
 
 # 多任务对比
 python benchmarl/run.py algorithm=mappo task=vmas/balance,vmas/navigation
 ```
+
+> **注意**：IPPO-Hebbian 算法需要自定义网络配置（MLP + Hebbian 层组合），因此使用独立的示例脚本 `examples/running/run_ippo_hebbian.py` 运行，而不是通过 Hydra 命令行。
 
 ### 修改训练参数
 
@@ -213,6 +250,8 @@ python benchmarl/resume.py <checkpoint_path>
 ```bash
 python benchmarl/run.py algorithm=mappo task=vmas/navigation evaluation.save_video=False
 ```
+或者
+
 
 ### 2. CUDA 版本问题
 

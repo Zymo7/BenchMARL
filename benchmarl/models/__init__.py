@@ -16,9 +16,12 @@ from .deepsets import Deepsets, DeepsetsConfig
 from .gnn import Gnn, GnnConfig
 from .gru import Gru, GruConfig
 from .lstm import Lstm, LstmConfig
+from .hebbian import Hebbian, HebbianConfig
 from .mlp import Mlp, MlpConfig
 
 classes = [
+    "Hebbian",
+    "HebbianConfig",
     "Mlp",
     "MlpConfig",
     "Gnn",
@@ -34,6 +37,7 @@ classes = [
 ]
 
 model_config_registry = {
+    "hebbian": HebbianConfig,
     "mlp": MlpConfig,
     "gnn": GnnConfig,
     "cnn": CnnConfig,

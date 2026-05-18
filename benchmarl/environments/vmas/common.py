@@ -88,6 +88,7 @@ class VmasTask(Task):
     BALANCE = None
     SAMPLING = None
     NAVIGATION = None
+    NAVIGATION_OBS = None
     TRANSPORT = None
     REVERSE_TRANSPORT = None
     WHEEL = None
