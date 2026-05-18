@@ -32,13 +32,13 @@ if __name__ == "__main__":
 
     # Load configs from yaml
     experiment_config = ExperimentConfig.get_from_yaml()
-    task = VmasTask.NAVIGATION.get_from_yaml()
+    task = VmasTask.NAVIGATION_DYNAMIC_OBS.get_from_yaml()
     algorithm_config = IppoHebbianConfig.get_from_yaml()
 
     # Phase 1: limit training iterations for PPO phase
     experiment_config.max_n_iters = 100  # For Full training
-    # experiment_config.max_n_iters = 5 # For quick testing
-    
+    # experiment_config.max_n_iters = 5  # For quick testing
+
     # Save outputs to outputs/ folder (same as hydra-based runs)
     output_dir = Path(__file__).parent.parent / "outputs"
     output_dir.mkdir(exist_ok=True)

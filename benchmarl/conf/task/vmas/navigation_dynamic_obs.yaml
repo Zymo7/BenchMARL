@@ -1,0 +1,42 @@
+defaults:
+  - _self_
+
+max_steps: 200
+
+# Number of agents
+n_agents: 3
+
+# Number of dynamic obstacles
+n_obstacles: 3
+
+# Dynamic obstacle motion modes: "linear", "circular", "random"
+# This list cycles if there are more obstacles than modes
+obstacle_modes:
+  - linear
+  - circular
+  - random
+
+# Dynamic obstacle parameters
+obstacle_speed: 0.05
+obstacle_linear_range: 0.5
+obstacle_circular_radius: 0.3
+obstacle_random_noise: 0.1
+
+# World spawning area
+world_spawning_x: 1.0
+world_spawning_y: 1.0
+
+# Lidar sensor configuration
+lidar_range: 0.3
+n_lidar_rays: 12
+
+# Reward configuration
+shared_rew: False
+final_reward: 0.01
+agent_collision_penalty: -2.0
+
+# Agent geometry
+agent_radius: 0.1
+
+# Rendering (communication lines range, 0 = disabled)
+comms_rendering_range: 0

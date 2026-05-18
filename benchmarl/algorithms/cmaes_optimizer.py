@@ -195,6 +195,53 @@ class CmaesHebbianOptimizer:
 
         return best_x
 
+    def plot_convergence(self, output_dir: str):
+        """Generate CMA-ES convergence plot from outcmaes/fit.dat.
+
+        Args:
+            output_dir: Directory to save the plot (e.g. experiment_folder)
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fit_path = os.path.join(os.getcwd(), "outcmaes", "fit.dat")
+        if not os.path.exists(fit_path):
+            print(f"  Skipping convergence plot: {fit_path} not found")
+            return
+
+        data = np.loadtxt(fit_path, comments="%")
+        gen = data[:, 0]
+        bestever = data[:, 4]
+        best = data[:, 5]
+        median = data[:, 6]
+        worst = data[:, 7]
+        sigma = data[:, 2]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        ax1.plot(gen, -best, label="Best", color="blue")
+        ax1.plot(gen, -bestever, label="Best Ever", color="green", linestyle="--")
+        ax1.plot(gen, -median, label="Median", color="orange", alpha=0.7)
+        ax1.fill_between(gen, -worst, -best, alpha=0.15, color="blue")
+        ax1.set_xlabel("Generation")
+        ax1.set_ylabel("Reward")
+        ax1.set_title("CMA-ES Convergence (Hebbian ABCD)")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        ax2.semilogy(gen, sigma, color="red")
+        ax2.set_xlabel("Generation")
+        ax2.set_ylabel("Sigma (step size)")
+        ax2.set_title("CMA-ES Step Size")
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, "cmaes_convergence.png")
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"  Convergence plot saved to: {plot_path}")
+
     def get_best_abcd_so_far(self):
         """Return the best ABCD vector found so far (useful after interrupt)."""
         return self._best_abcd_so_far
