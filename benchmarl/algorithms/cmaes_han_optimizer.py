@@ -23,6 +23,7 @@ class CmaesHanOptimizer:
         "navigation",
         "navigation_avoidance",
         "navigation_v2",
+        "navigation_avoidance_v2",
     ]
 
     def __init__(
@@ -35,7 +36,9 @@ class CmaesHanOptimizer:
         max_gens: int = 100,
         n_eval_episodes: int = 10,
         device: str = "cpu",
-        collision_penalty_weight: float = 1.0,
+        collision_penalty_weight: float = 2.0,
+        safety_distance: float = 0.15,
+        neighbor_radius: float = 0.5,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -46,6 +49,8 @@ class CmaesHanOptimizer:
         self.n_eval_episodes = n_eval_episodes
         self.device = device
         self.collision_penalty_weight = collision_penalty_weight
+        self.safety_distance = safety_distance
+        self.neighbor_radius = neighbor_radius
 
         self.policy = experiment.policy
 
@@ -64,8 +69,21 @@ class CmaesHanOptimizer:
                          initial_goal_dists: torch.Tensor = None,
                          final_goal_dists: torch.Tensor = None,
                          success: bool = False,
+                         agent_collision_ratios: torch.Tensor = None,
                          ) -> float:
-        """Compute fitness value from episode data based on fitness mode."""
+        """Compute fitness value from episode data based on fitness mode.
+
+        Args:
+            episode_reward: total reward accumulated during the episode.
+            collision_count: total number of obstacle collisions (from env).
+            total_steps: number of environment steps in the episode.
+            initial_goal_dists: per-agent distance to goal at episode start.
+            final_goal_dists: per-agent distance to goal at episode end.
+            success: True if all agents reached their goals.
+            agent_collision_ratios: (n_agents,) per-agent fraction of steps
+                where the agent was within safety_distance of a neighbor
+                (within neighbor_radius). Used by ``navigation_avoidance_v2``.
+        """
         if self.fitness_mode == "navigation":
             return episode_reward
         elif self.fitness_mode == "navigation_avoidance":
@@ -88,6 +106,33 @@ class CmaesHanOptimizer:
             w_success = 5.0
             w_final = 1.0
             return w_progress * mean_progress + w_success * success_term + w_final * final_term
+        elif self.fitness_mode == "navigation_avoidance_v2":
+            if initial_goal_dists is None or final_goal_dists is None:
+                raise ValueError("navigation_avoidance_v2 mode requires initial/final goal distances")
+            if agent_collision_ratios is None:
+                raise ValueError("navigation_avoidance_v2 mode requires agent_collision_ratios")
+            eps = 1e-6
+            progress = ((initial_goal_dists - final_goal_dists).clamp(min=0.0)
+                        / (initial_goal_dists + eps))
+            mask = (initial_goal_dists > eps)
+            if mask.any():
+                mean_progress = progress[mask].mean().item()
+            else:
+                mean_progress = 0.0
+            success_term = 1.0 if success else 0.0
+            mean_final = final_goal_dists.mean().item() if mask.any() else 0.0
+            final_term = -mean_final
+            # Per-agent collision penalty: mean across agents of the
+            # fraction of steps each agent spent in collision.
+            mean_collision_ratio = agent_collision_ratios.mean().item()
+            w_progress = 3.0
+            w_success = 5.0
+            w_final = 1.0
+            w_collision = self.collision_penalty_weight
+            return (w_progress * mean_progress
+                    + w_success * success_term
+                    + w_final * final_term
+                    - w_collision * mean_collision_ratio)
         else:
             raise ValueError(f"Unknown fitness mode: {self.fitness_mode}")
 
@@ -106,6 +151,12 @@ class CmaesHanOptimizer:
         step = 0
         success = False
 
+        # Per-agent counter of steps where the agent was within
+        # safety_distance of any neighbor inside neighbor_radius.
+        # Shape: (n_agents,). Set up after we observe the first batch.
+        agent_collision_steps = None
+        n_agents = None
+
         while not done and step < max_steps:
             td = policy(td)
             td = env.step(td)
@@ -122,6 +173,54 @@ class CmaesHanOptimizer:
                 if col_rew is not None:
                     collision_count += (col_rew < 0).sum().item()
 
+            # Inter-agent collision detection: for each agent, count this
+            # step if it has any neighbor within neighbor_radius AND that
+            # neighbor is also within safety_distance.
+            next_obs = td.get(("next", group, "observation"))
+            if next_obs is not None and next_obs.dim() >= 2:
+                # Positions are in the first 2 dims of observation
+                # (agent.pos - goal.pos, so to recover absolute pos we
+                # would need the goal, but for collision we only need
+                # RELATIVE positions between agents — that is, the
+                # differences of obs[:2] which equal differences of
+                # positions).
+                pos_rel = next_obs[..., :2].float()  # (..., n_agents, 2) or (n_agents, 2)
+                # Flatten leading batch dims into one for pairwise diffs.
+                if pos_rel.dim() == 3:
+                    # (batch, n_agents, 2)
+                    b, a, _ = pos_rel.shape
+                    if n_agents is None:
+                        n_agents = a
+                        agent_collision_steps = torch.zeros(a, device=pos_rel.device)
+                    # Pairwise relative positions: diff[i,j] = pos[j] - pos[i]
+                    diff = pos_rel.unsqueeze(1) - pos_rel.unsqueeze(2)  # (b, a, a, 2)
+                    dist = torch.linalg.vector_norm(diff, dim=-1)        # (b, a, a)
+                    # Exclude self
+                    eye = torch.eye(a, device=dist.device, dtype=torch.bool)
+                    dist = dist.masked_fill(eye, float("inf"))
+                    # Neighbors within neighbor_radius
+                    in_radius = dist < self.neighbor_radius
+                    # Within safety_distance
+                    in_collision = dist < self.safety_distance
+                    # An agent i is in collision at this step if it has
+                    # ANY neighbor j satisfying BOTH conditions.
+                    agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (b, a)
+                    agent_collision_steps += agent_in_collision.any(dim=0).float()
+                elif pos_rel.dim() == 2:
+                    # (n_agents, 2)
+                    a = pos_rel.shape[0]
+                    if n_agents is None:
+                        n_agents = a
+                        agent_collision_steps = torch.zeros(a, device=pos_rel.device)
+                    diff = pos_rel.unsqueeze(0) - pos_rel.unsqueeze(1)  # (a, a, 2)
+                    dist = torch.linalg.vector_norm(diff, dim=-1)
+                    eye = torch.eye(a, device=dist.device, dtype=torch.bool)
+                    dist = dist.masked_fill(eye, float("inf"))
+                    in_radius = dist < self.neighbor_radius
+                    in_collision = dist < self.safety_distance
+                    agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (a,)
+                    agent_collision_steps += agent_in_collision.float()
+
             done = td.get(("next", "done")).any().item()
             if done:
                 success = True
@@ -133,6 +232,14 @@ class CmaesHanOptimizer:
             final_obs[..., :2].float(), dim=-1
         )
 
+        # Per-agent collision ratio = (steps in collision) / total_steps.
+        # If n_agents is 1, no inter-agent collisions possible.
+        if n_agents is not None and n_agents > 1 and step > 0:
+            agent_collision_ratios = agent_collision_steps / float(step)
+        else:
+            agent_collision_ratios = torch.zeros(n_agents if n_agents is not None else 1,
+                                                 device=self.device)
+
         return {
             "episode_reward": episode_reward,
             "collision_count": collision_count,
@@ -140,6 +247,7 @@ class CmaesHanOptimizer:
             "success": success,
             "initial_goal_dists": initial_goal_dists,
             "final_goal_dists": final_goal_dists,
+            "agent_collision_ratios": agent_collision_ratios,
         }
 
     def fitness(self, x: np.ndarray) -> float:
@@ -163,6 +271,7 @@ class CmaesHanOptimizer:
                     initial_goal_dists=stats["initial_goal_dists"],
                     final_goal_dists=stats["final_goal_dists"],
                     success=stats["success"],
+                    agent_collision_ratios=stats["agent_collision_ratios"],
                 )
                 fitnesses.append(ep_fitness)
 
@@ -405,6 +514,7 @@ class CmaesHanOptimizer:
                     initial_goal_dists=stats["initial_goal_dists"],
                     final_goal_dists=stats["final_goal_dists"],
                     success=stats["success"],
+                    agent_collision_ratios=stats["agent_collision_ratios"],
                 )
                 all_fitnesses.append(ep_fitness)
 

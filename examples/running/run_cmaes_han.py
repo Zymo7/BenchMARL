@@ -22,13 +22,33 @@ def parse_args():
         type=str,
         default="navigation_v2",
         choices=CmaesHanOptimizer.FITNESS_MODES,
-        help="Fitness function mode.",
+        help="Fitness function mode. 'navigation_avoidance_v2' adds "
+             "inter-agent collision penalty based on per-agent collision "
+             "ratios (fraction of steps each agent spent within "
+             "safety_distance of a neighbor within neighbor_radius).",
     )
     parser.add_argument(
         "--collision-penalty-weight",
         type=float,
-        default=1.0,
-        help="Weight for collision penalty in navigation_avoidance mode",
+        default=2.0,
+        help="Weight for collision penalty. Used in 'navigation_avoidance' "
+             "(per-step obstacle collisions) and in 'navigation_avoidance_v2' "
+             "(per-agent mean collision ratio).",
+    )
+    parser.add_argument(
+        "--safety-distance",
+        type=float,
+        default=0.15,
+        help="Inter-agent distance below which two agents are considered "
+             "in collision. Used by 'navigation_avoidance_v2'.",
+    )
+    parser.add_argument(
+        "--neighbor-radius",
+        type=float,
+        default=0.5,
+        help="Radius within which other agents are considered neighbors. "
+             "Only neighbors within this radius are checked for collision. "
+             "Used by 'navigation_avoidance_v2'.",
     )
 
     # Task selection
@@ -38,6 +58,19 @@ def parse_args():
         default="navigation_static_dynamic_obs",
         choices=["navigation_static_dynamic_obs", "navigation_dynamic_obs"],
         help="VMAS task to use",
+    )
+    parser.add_argument(
+        "--n-static-obstacles",
+        type=int,
+        default=2,
+        help="Number of static obstacles. Set to 0 to disable environment "
+             "obstacles (so only inter-agent collisions matter).",
+    )
+    parser.add_argument(
+        "--n-dynamic-obstacles",
+        type=int,
+        default=0,
+        help="Number of dynamic obstacles. Set to 0 to disable.",
     )
 
     # CMA-ES parameters
@@ -72,11 +105,19 @@ args = parse_args()
 
 def _get_task():
     if args.task == "navigation_static_dynamic_obs":
-        return VmasTask.NAVIGATION_STATIC_DYNAMIC_OBS.get_from_yaml()
+        task = VmasTask.NAVIGATION_STATIC_DYNAMIC_OBS.get_from_yaml()
     elif args.task == "navigation_dynamic_obs":
-        return VmasTask.NAVIGATION_DYNAMIC_OBS.get_from_yaml()
+        task = VmasTask.NAVIGATION_DYNAMIC_OBS.get_from_yaml()
     else:
         raise ValueError(f"Unknown task: {args.task}")
+    # Apply obstacle-count overrides via task.config dict.
+    if "n_static_obstacles" in task.config:
+        task.config["n_static_obstacles"] = args.n_static_obstacles
+    if "n_dynamic_obstacles" in task.config:
+        task.config["n_dynamic_obstacles"] = args.n_dynamic_obstacles
+    if "n_obstacles" in task.config:
+        task.config["n_obstacles"] = 0
+    return task
 
 
 def _create_model_config():
@@ -131,7 +172,12 @@ if __name__ == "__main__":
     print("CMA-ES Hebbian Attractor Network (HAN) Training")
     print("=" * 60)
     print(f"Task: {args.task}")
+    print(f"  n_static_obstacles={args.n_static_obstacles}, n_dynamic_obstacles={args.n_dynamic_obstacles}")
     print(f"Fitness mode: {args.fitness_mode}")
+    if args.fitness_mode in ("navigation_avoidance", "navigation_avoidance_v2"):
+        print(f"  collision_penalty_weight={args.collision_penalty_weight}")
+    if args.fitness_mode == "navigation_avoidance_v2":
+        print(f"  safety_distance={args.safety_distance}, neighbor_radius={args.neighbor_radius}")
     print(f"Network: input -> {args.hidden_size} -> output (single hidden layer)")
     print(f"HAN: window_size={args.window_size}, f_nn={args.f_nn}, f_hebb={args.f_hebb}, "
           f"update_interval={args.f_nn // args.f_hebb if args.f_hebb > 0 and args.f_nn >= args.f_hebb else 'disabled'}")
@@ -214,6 +260,8 @@ if __name__ == "__main__":
             n_eval_episodes=args.n_eval_episodes,
             device=experiment.config.train_device,
             collision_penalty_weight=args.collision_penalty_weight,
+            safety_distance=args.safety_distance,
+            neighbor_radius=args.neighbor_radius,
         )
 
         best_abcd = optimizer.run()
