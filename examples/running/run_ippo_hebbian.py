@@ -36,7 +36,7 @@ if __name__ == "__main__":
     algorithm_config = IppoHebbianConfig.get_from_yaml()
 
     # Phase 1: limit training iterations for PPO phase
-    experiment_config.max_n_iters = 100  # For Full training
+    experiment_config.max_n_iters = 200  # For Full training
     # experiment_config.max_n_iters = 5 # For quick testing
     
     # Save outputs to outputs/ folder (same as hydra-based runs)

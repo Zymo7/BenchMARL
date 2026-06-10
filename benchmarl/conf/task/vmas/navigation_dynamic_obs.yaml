@@ -17,7 +17,7 @@ obstacle_modes:
   - random
 
 # Dynamic obstacle parameters
-obstacle_speed: 0.05
+obstacle_speed: 0.02
 obstacle_linear_range: 0.5
 obstacle_circular_radius: 0.3
 obstacle_random_noise: 0.1

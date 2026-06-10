@@ -260,6 +260,7 @@ class CmaesHebbianOptimizer:
         Saves:
         - abcd_params.npy: The best ABCD parameter vector
         - hebbian_state.pt: The full HebbianLayer state dict
+        - policy_state.pt: The full policy state dict (for evaluate-only mode)
         - results.json: Metadata (fitness, generations, etc.)
 
         Args:
@@ -276,6 +277,10 @@ class CmaesHebbianOptimizer:
         # Save HebbianLayer state dict
         state_path = os.path.join(abcd_dir, "hebbian_state.pt")
         torch.save(self.hebbian_layer.state_dict(), state_path)
+
+        # Save full policy state dict (needed for evaluate-only mode)
+        policy_path = os.path.join(abcd_dir, "policy_state.pt")
+        torch.save(self.policy.state_dict(), policy_path)
 
         # Save metadata
         metadata = {

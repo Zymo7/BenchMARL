@@ -23,7 +23,7 @@ class TaskConfig:
     obstacle_modes: List[str] = field(default_factory=lambda: ["linear", "circular", "random"])
 
     # Dynamic obstacle parameters
-    obstacle_speed: float = 0.05
+    obstacle_speed: float = 0.02
     obstacle_linear_range: float = 0.5
     obstacle_circular_radius: float = 0.3
     obstacle_random_noise: float = 0.1
