@@ -9,6 +9,8 @@ from .ensemble import EnsembleAlgorithm, EnsembleAlgorithmConfig
 from .iddpg import Iddpg, IddpgConfig
 from .ippo import Ippo, IppoConfig
 from .ippo_hebbian import IppoHebbian, IppoHebbianConfig
+from .cmaes_hebbian import CmaesHebbian, CmaesHebbianConfig
+from .cmaes_han import CmaesHan, CmaesHanConfig
 from .iql import Iql, IqlConfig
 from .isac import Isac, IsacConfig
 from .maddpg import Maddpg, MaddpgConfig
@@ -24,6 +26,10 @@ classes = [
     "IppoConfig",
     "IppoHebbian",
     "IppoHebbianConfig",
+    "CmaesHebbian",
+    "CmaesHebbianConfig",
+    "CmaesHan",
+    "CmaesHanConfig",
     "IppoConfig",
     "Iql",
     "IqlConfig",
@@ -47,6 +53,8 @@ algorithm_config_registry = {
     "mappo": MappoConfig,
     "ippo": IppoConfig,
     "ippo_hebbian": IppoHebbianConfig,
+    "cmaes_hebbian": CmaesHebbianConfig,
+    "cmaes_han": CmaesHanConfig,
     "maddpg": MaddpgConfig,
     "iddpg": IddpgConfig,
     "masac": MasacConfig,

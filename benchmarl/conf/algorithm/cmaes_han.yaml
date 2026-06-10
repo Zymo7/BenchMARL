@@ -1,0 +1,2 @@
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: True

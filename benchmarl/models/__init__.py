@@ -17,11 +17,17 @@ from .gnn import Gnn, GnnConfig
 from .gru import Gru, GruConfig
 from .lstm import Lstm, LstmConfig
 from .hebbian import Hebbian, HebbianConfig
+from .full_hebbian import FullHebbianModel, FullHebbianConfig
+from .han import HanConfig, HanModel
 from .mlp import Mlp, MlpConfig
 
 classes = [
     "Hebbian",
     "HebbianConfig",
+    "FullHebbianModel",
+    "FullHebbianConfig",
+    "HanModel",
+    "HanConfig",
     "Mlp",
     "MlpConfig",
     "Gnn",
@@ -38,6 +44,8 @@ classes = [
 
 model_config_registry = {
     "hebbian": HebbianConfig,
+    "full_hebbian": FullHebbianConfig,
+    "han": HanConfig,
     "mlp": MlpConfig,
     "gnn": GnnConfig,
     "cnn": CnnConfig,

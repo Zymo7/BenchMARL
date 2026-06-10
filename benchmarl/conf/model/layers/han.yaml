@@ -1,0 +1,15 @@
+name: han
+
+# Single 18-dim hidden layer: input -> 18 -> output.
+hidden_size: 18
+lr_hebb: 0.01
+weight_init: 1.0
+# Sliding-window length M for time-averaged ABCD update.
+window_size: 10
+# Inference frequency (always 1 env step). Weight-update frequency.
+# An update fires every (f_nn // f_hebb) env steps.
+f_nn: 4
+f_hebb: 1
+activation_class: null
+activation_kwargs: null
+num_feature_dims: 1
