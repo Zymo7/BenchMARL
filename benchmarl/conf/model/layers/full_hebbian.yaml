@@ -1,0 +1,9 @@
+name: full_hebbian
+
+hidden_size: 9
+lr_hebb: 0.01
+weight_init: 1.0
+w_max: 1.0
+activation_class: null
+activation_kwargs: null
+num_feature_dims: 1
