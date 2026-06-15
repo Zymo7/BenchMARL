@@ -65,6 +65,25 @@ class CmaesHanOptimizer:
     def set_abcd_from_vector(self, x: np.ndarray):
         self.han_model.set_abcd_from_vector(torch.tensor(x, device=self.device))
 
+    def _get_vmas_core(self):
+        """Walk the wrapper chain to reach the underlying vmas Environment.
+
+        Returns the object that exposes ``agents`` with ``state.pos`` —
+        the source of truth for absolute agent positions. Result is
+        cached on the optimizer because the wrapper chain does not change.
+        """
+        if hasattr(self, "_vmas_core") and self._vmas_core is not None:
+            return self._vmas_core
+        env = self.experiment.test_env
+        node = env
+        while True:
+            nxt = getattr(node, "base_env", None) or getattr(node, "_env", None)
+            if nxt is None or nxt is node:
+                break
+            node = nxt
+        self._vmas_core = node
+        return node
+
     def _compute_fitness(self, episode_reward: float, collision_count: int, total_steps: int,
                          initial_goal_dists: torch.Tensor = None,
                          final_goal_dists: torch.Tensor = None,
@@ -173,53 +192,35 @@ class CmaesHanOptimizer:
                 if col_rew is not None:
                     collision_count += (col_rew < 0).sum().item()
 
-            # Inter-agent collision detection: for each agent, count this
-            # step if it has any neighbor within neighbor_radius AND that
-            # neighbor is also within safety_distance.
-            next_obs = td.get(("next", group, "observation"))
-            if next_obs is not None and next_obs.dim() >= 2:
-                # Positions are in the first 2 dims of observation
-                # (agent.pos - goal.pos, so to recover absolute pos we
-                # would need the goal, but for collision we only need
-                # RELATIVE positions between agents — that is, the
-                # differences of obs[:2] which equal differences of
-                # positions).
-                pos_rel = next_obs[..., :2].float()  # (..., n_agents, 2) or (n_agents, 2)
-                # Flatten leading batch dims into one for pairwise diffs.
-                if pos_rel.dim() == 3:
-                    # (batch, n_agents, 2)
-                    b, a, _ = pos_rel.shape
-                    if n_agents is None:
-                        n_agents = a
-                        agent_collision_steps = torch.zeros(a, device=pos_rel.device)
-                    # Pairwise relative positions: diff[i,j] = pos[j] - pos[i]
-                    diff = pos_rel.unsqueeze(1) - pos_rel.unsqueeze(2)  # (b, a, a, 2)
-                    dist = torch.linalg.vector_norm(diff, dim=-1)        # (b, a, a)
-                    # Exclude self
-                    eye = torch.eye(a, device=dist.device, dtype=torch.bool)
-                    dist = dist.masked_fill(eye, float("inf"))
-                    # Neighbors within neighbor_radius
-                    in_radius = dist < self.neighbor_radius
-                    # Within safety_distance
-                    in_collision = dist < self.safety_distance
-                    # An agent i is in collision at this step if it has
-                    # ANY neighbor j satisfying BOTH conditions.
-                    agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (b, a)
-                    agent_collision_steps += agent_in_collision.any(dim=0).float()
-                elif pos_rel.dim() == 2:
-                    # (n_agents, 2)
-                    a = pos_rel.shape[0]
-                    if n_agents is None:
-                        n_agents = a
-                        agent_collision_steps = torch.zeros(a, device=pos_rel.device)
-                    diff = pos_rel.unsqueeze(0) - pos_rel.unsqueeze(1)  # (a, a, 2)
-                    dist = torch.linalg.vector_norm(diff, dim=-1)
-                    eye = torch.eye(a, device=dist.device, dtype=torch.bool)
-                    dist = dist.masked_fill(eye, float("inf"))
-                    in_radius = dist < self.neighbor_radius
-                    in_collision = dist < self.safety_distance
-                    agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (a,)
-                    agent_collision_steps += agent_in_collision.float()
+            # Inter-agent collision detection: use ABSOLUTE agent
+            # positions read from the vmas core environment. We cannot
+            # recover absolute positions from obs[:2] because each agent
+            # has its own goal (obs[:2] = agent.pos - agent.goal), and
+            # the goal offset does NOT cancel when subtracting two
+            # different agents' obs[:2]. The pairwise difference
+            # (obs[i,:2] - obs[j,:2]) = (pos[i] - pos[j]) + (goal[j] -
+            # goal[i]), which is biased by per-agent goal offsets.
+            core = self._vmas_core
+            if core is not None and hasattr(core, "agents"):
+                if n_agents is None:
+                    n_agents = len(core.agents)
+                    agent_collision_steps = torch.zeros(n_agents, device=self.device)
+                # Stack absolute positions: (num_envs, n_agents, 2).
+                # For collision we use the FIRST parallel env (env index
+                # 0) since the optimizer's _run_one_episode is a
+                # single-trajectory rollout.
+                pos_stack = torch.stack(
+                    [a.state.pos[0] for a in core.agents], dim=0
+                )  # (n_agents, 2)
+                a = pos_stack.shape[0]
+                diff = pos_stack.unsqueeze(0) - pos_stack.unsqueeze(1)  # (a, a, 2)
+                dist = torch.linalg.vector_norm(diff, dim=-1)           # (a, a)
+                eye = torch.eye(a, device=dist.device, dtype=torch.bool)
+                dist = dist.masked_fill(eye, float("inf"))
+                in_radius = dist < self.neighbor_radius
+                in_collision = dist < self.safety_distance
+                agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (a,)
+                agent_collision_steps += agent_in_collision.float()
 
             done = td.get(("next", "done")).any().item()
             if done:
@@ -256,6 +257,9 @@ class CmaesHanOptimizer:
         self.set_abcd_from_vector(x)
         # reset_all_weights also clears the sliding windows and resets ticks.
         self.han_model.reset_all_weights()
+        # Cache the vmas core env (used for absolute position readout
+        # during inter-agent collision detection).
+        self._get_vmas_core()
 
         fitnesses = []
         group = list(self.experiment.group_map.keys())[0]
