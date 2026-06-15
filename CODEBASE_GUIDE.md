@@ -1,102 +1,63 @@
 # BenchMARL 代码库使用指南
 
-## 目录结构
-
-```
-BenchMARL/
-├── benchmarl/                    # 核心源代码
-│   ├── algorithms/               # MARL 算法实现
-│   ├── benchmark/                # 基准测试相关
-│   ├── conf/                     # Hydra 配置文件
-│   │   ├── algorithm/            # 算法配置
-│   │   ├── experiment/           # 实验配置
-│   │   ├── model/                # 模型配置
-│   │   └── task/                 # 任务环境配置
-│   │       ├── vmas/             # VMAS 环境
-│   │       ├── smacv2/           # SMACv2 环境
-│   │       ├── pettingzoo/       # PettingZoo 环境
-│   │       ├── meltingpot/       # MeltingPot 环境
-│   │       └── magent/           # MAgent2 环境
-│   ├── environments/             # 环境封装
-│   ├── experiment/               # 实验运行逻辑
-│   ├── models/                   # 神经网络模型
-│   ├── run.py                    # 主入口脚本
-│   ├── evaluate.py               # 评估脚本
-│   ├── resume.py                 # 恢复训练脚本
-│   ├── eval_results.py           # 结果评估工具
-│   ├── hydra_config.py           # Hydra 配置加载
-│   └── utils.py                  # 工具函数
-├── examples/                     # 示例代码
-├── fine_tuned/                   # 调优后的基准配置
-└── outputs/                     # 实验输出目录
-```
+本指南整合仓库内全部算法、模型、任务、实验配置与运行命令，并按主题分章节组织。
 
 ---
 
-## 核心模块详解
+## 目录
 
-### 1. algorithms/ - 算法模块
+1. [算法](#1-算法)
+2. [任务与环境](#2-任务与环境)
+3. [模型](#3-模型)
+4. [实验配置](#4-实验配置)
+5. [快捷运行命令](#5-快捷运行命令)
+6. [常见问题](#6-常见问题)
 
-| 算法 | 配置文件 | 类型 | 适用动作空间 |
-|------|----------|------|-------------|
-| **MAPPO** | `mappo.yaml` | On-policy | 连续 + 离散 |
-| **IPPO** | `ippo.yaml` | On-policy | 连续 + 离散 |
-| **IPPO-Hebbian** | `ippo_hebbian.yaml` | On-policy | 连续 + 离散 |
-| **MADDPG** | `maddpg.yaml` | Off-policy | 连续 |
-| **IDDPG** | `iddpg.yaml` | Off-policy | 连续 |
-| **MASAC** | `masac.yaml` | Off-policy | 连续 + 离散 |
-| **ISAC** | `isac.yaml` | Off-policy | 连续 + 离散 |
-| **QMIX** | `qmix.yaml` | Off-policy | 离散 |
-| **VDN** | `vdn.yaml` | Off-policy | 离散 |
-| **IQL** | `iql.yaml` | Off-policy | 离散 |
+---
 
-#### MAPPO 算法特有参数
+## 1. 算法
+
+仓库内算法分两大类：
+
+- **基于梯度（PPO/SAC/Q 系列）**：使用 PyTorch + TorchRL 进行 on-policy 或 off-policy 训练，通过 Hydra 入口 `benchmarl/run.py` 运行；
+- **基于演化（CMA-ES 系列）**：直接优化模型参数（不依赖梯度），通过 `examples/running/run_*.py` 入口运行。
+
+### 1.1 算法总览
+
+| 算法 | 配置文件 | 类型 | 适用动作空间 | 训练范式 | 入口脚本 |
+|------|----------|------|-------------|----------|----------|
+| **MAPPO** | `mappo.yaml` | On-policy | 连续 + 离散 | PPO | `benchmarl/run.py` |
+| **IPPO** | `ippo.yaml` | On-policy | 连续 + 离散 | PPO | `benchmarl/run.py` |
+| **IPPO-Hebbian** | `ippo_hebbian.yaml` | On-policy | 连续 + 离散 | PPO + CMA-ES 两阶段 | `examples/running/run_ippo_hebbian.py` |
+| **MADDPG** | `maddpg.yaml` | Off-policy | 连续 | DDPG | `benchmarl/run.py` |
+| **IDDPG** | `iddpg.yaml` | Off-policy | 连续 | DDPG | `benchmarl/run.py` |
+| **MASAC** | `masac.yaml` | Off-policy | 连续 + 离散 | SAC | `benchmarl/run.py` |
+| **ISAC** | `isac.yaml` | Off-policy | 连续 + 离散 | SAC | `benchmarl/run.py` |
+| **QMIX** | `qmix.yaml` | Off-policy | 离散 | Q-learning | `benchmarl/run.py` |
+| **VDN** | `vdn.yaml` | Off-policy | 离散 | Q-learning | `benchmarl/run.py` |
+| **IQL** | `iql.yaml` | Off-policy | 离散 | Q-learning | `benchmarl/run.py` |
+| **CmaesFullHebbian** | `cmaes_hebbian.yaml` | — | 连续 | CMA-ES（单阶段） | `examples/running/run_cmaes_hebbian.py` |
+| **CmaesHan** | `cmaes_han.yaml` | — | 连续 | CMA-ES（单阶段） | `examples/running/run_cmaes_han.py` |
+
+> 算法配置文件位于 `benchmarl/conf/algorithm/`，注册入口在 `benchmarl/algorithms/__init__.py`。
+
+### 1.2 通用算法参数
+
+所有 PPO 系（MAPPO / IPPO）共享以下核心参数：
+
 ```yaml
 share_param_critic: True       # 是否共享 Critic 参数
 clip_epsilon: 0.2              # PPO 裁剪 epsilon
 entropy_coef: 0.0              # 熵系数
-critic_coef: 1.0              # Critic 损失系数
-loss_critic_type: "l2"        # Critic 损失类型
-lmbda: 0.9                    # GAE lambda
+critic_coef: 1.0               # Critic 损失系数
+loss_critic_type: "l2"         # Critic 损失类型
+lmbda: 0.9                     # GAE lambda
 use_tanh_normal: True          # 是否使用 tanh 正态分布
 ```
 
-### 2. environments/ - 环境模块
+### 1.3 IPPO-Hebbian（两阶段：PPO + CMA-ES）
 
-#### 支持的环境
-
-| 环境 | 安装命令 | 任务数 | 向量化 |
-|------|----------|--------|--------|
-| **VMAS** | `pip install vmas` | 27 | Yes |
-| **SMACv2** | 见 [安装指南](README.md#smacv2) | 15 | No |
-| **PettingZoo** | `pip install "pettingzoo[all]"` | 10 | No |
-| **MeltingPot** | `pip install dm-meltingpot` | 49 | No |
-| **MAgent2** | `pip install git+https://github.com/Farama-Foundation/MAgent2` | 1 | No |
-
-#### VMAS 任务列表
-- **平衡类**: `balance`, `wheel`
-- **导航类**: `navigation`, `discovery`, `flocking`, `wind_flocking`
-- **通道类**: `passage`, `joint_passage`, `joint_passage_size`, `ball_passage`
-- **对抗类**: `simple_tag`, `simple_push`, `simple_adversary`
-- **合作类**: `simple_spread`, `simple_reference`, `simple_speaker_listener`
-- **传输类**: `transport`, `reverse_transport`, `football`
-- **其他**: `buzz_wire`, `dropout`, `sampling`, `dispersion`, `give_way`, `multi_give_way`, `ball_trajectory`
-
-### 3. models/ - 模型模块
-
-| 模型 | 说明 | 适用场景 |
-|------|------|----------|
-| **MLP** | 多层感知机 | 默认选择 |
-| **Hebbian** | 赫布学习动态层 | 在线自适应 |
-| **GRU** | 门控循环单元 | 时序依赖 |
-| **LSTM** | 长短期记忆网络 | 时序依赖 |
-| **GNN** | 图神经网络 | 多智能体通信 |
-| **CNN** | 卷积神经网络 | 视觉输入 |
-| **Deepsets** | 深集合网络 | 置换不变性 |
-
-#### IPPO-Hebbian 算法说明
-
-IPPO-Hebbian 是一种两阶段训练算法，结合了 IPPO 的策略优化和赫布学习的在线适应能力。
+IPPO-Hebbian 把前两层 MLP 用 PPO 训练，最后一层用赫布规则在线更新，并通过 CMA-ES 优化赫布 ABCD 参数。
 
 **网络架构**：
 ```
@@ -106,24 +67,242 @@ IPPO-Hebbian 是一种两阶段训练算法，结合了 IPPO 的策略优化和�
                    W 在执行过程中按 ABCD 规则在线更新
 ```
 
-**赫布学习层 (Hebbian Layer)**：
-权重更新规则：$\Delta w_{ij} = A \cdot x_i \cdot y_j + B \cdot x_i + C \cdot y_j + D$
-
+**赫布学习层（Hebbian Layer）权重更新规则**：
+$$\Delta w_{ij} = A \cdot x_i \cdot y_j + B \cdot x_i + C \cdot y_j + D$$
 其中 $x_i$ 是前层神经元激活，$y_j$ 是输出神经元激活，A、B、C、D 是每个连接的四个学习参数。
 
 **训练阶段**：
-1. **Phase 1**：用 PPO 训练前两层 MLP，Hebbian 层固定（W 保持初始值）
-2. **Phase 2**：冻结 MLP 层，用 CMA-ES 优化 Hebbian 层的 ABCD 参数
+1. **Phase 1**：用 PPO 训练前两层 MLP，Hebbian 层固定（W 保持初始值）。
+2. **Phase 2**：冻结 MLP 层，用 CMA-ES 优化 Hebbian 层的 ABCD 参数。
 
-**运行方式**：
-```python
-# 示例脚本
-python examples/running/run_ippo_hebbian.py
+### 1.4 CmaesFullHebbian（Full HNN + CMA-ES）
+
+**网络结构**（3 层赫布层）：
+```
+输入 → HanLayer(hidden) → HanLayer(hidden) → HanLayer(output)
 ```
 
-### 4. experiment/ - 实验模块
+每一层权重 W 都按赫布规则在线更新；ABCD 参数全部由 CMA-ES 优化（单阶段训练）。碰撞惩罚可选 `navigation_avoidance` 模式。
 
-#### 关键实验参数
+### 1.5 CmaesHan（HAN：Hebbian Attractor Network + CMA-ES）
+
+HAN 是相对 Full HNN 的三机制强化版本。详细机制见 [§3.3](#33-hanmodel-赫布吸引子网络)。该算法用 CMA-ES 优化 HAN 的 ABCD 参数（单阶段训练，ABCD 单调收敛即可）。
+
+**核心参数**：
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `--hidden-size` | 18 | 单隐层宽度 |
+| `--window-size` | 10 | 滑动窗口长度 M |
+| `--f-nn` | 4 | 推理频率（每 f_nn 步 = 1 步 forward） |
+| `--f-hebb` | 1 | 权重更新频率（每 f_hebb 步 = 1 次 update） |
+| `--lr-hebb` | 0.01 | 赫布学习率 η |
+| `--cmaes-gens` | 50 | 进化代数 |
+| `--pop-size` | 30 | 种群规模 |
+| `--sigma0` | 0.5 | 初始步长 |
+| `--n-eval-episodes` | 3 | 每个 ABCD 候选的评估 episode 数 |
+
+**Fitness 模式**（`--fitness-mode`）：
+
+| 模式 | 公式 | 适用场景 |
+|------|------|----------|
+| `navigation` | `episode_reward` | 直接最大化环境奖励 |
+| `navigation_avoidance` | `episode_reward - λ × collision_count` | 简单加障碍物碰撞惩罚 |
+| `navigation_v2` | `3·progress + 5·success + 1·(-final_dist)` | 推荐默认；分项奖励 |
+| `navigation_avoidance_v2` | `3·progress + 5·success + 1·(-final_dist) - λ · mean(agent_collision_ratios)` | **新增**：含智能体间避碰 |
+
+`navigation_avoidance_v2` 模式新增参数：
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `--safety-distance` | 0.15 | 智能体间距离 < 该值即视为碰撞 |
+| `--neighbor-radius` | 0.5 | 邻居感知半径（只考虑该半径内的邻居） |
+| `--collision-penalty-weight` | 2.0 | 智能体间碰撞权重 λ |
+
+> **世界尺寸参考**：navigation_static_dynamic_obs 任务的 world 是 `[-1.0, +1.0] × [-1.0, +1.0]`（即 2.0×2.0），智能体半径 0.1，3 个智能体。
+> 推荐参数：`--safety-distance 0.25`（约 2.5× agent 半径）、`--neighbor-radius 0.5`（约 25% 地图宽）。
+
+---
+
+## 2. 任务与环境
+
+### 2.1 支持的环境
+
+| 环境 | 安装命令 | 任务数 | 向量化 |
+|------|----------|--------|--------|
+| **VMAS** | `pip install vmas` | 27 | Yes |
+| **SMACv2** | 见 [安装指南](README.md#smacv2) | 15 | No |
+| **PettingZoo** | `pip install "pettingzoo[all]"` | 10 | No |
+| **MeltingPot** | `pip install dm-meltingpot` | 49 | No |
+| **MAgent2** | `pip install git+https://github.com/Farama-Foundation/MAgent2` | 1 | No |
+
+### 2.2 VMAS 任务列表
+
+| 类别 | 任务名 |
+|------|--------|
+| 平衡类 | `balance`, `wheel` |
+| 导航类 | `navigation`, `navigation_obs`, `navigation_dynamic_obs`, `navigation_static_dynamic_obs`, `discovery`, `flocking`, `wind_flocking` |
+| 通道类 | `passage`, `joint_passage`, `joint_passage_size`, `ball_passage` |
+| 对抗类 | `simple_tag`, `simple_push`, `simple_adversary` |
+| 合作类 | `simple_spread`, `simple_reference`, `simple_speaker_listener` |
+| 传输类 | `transport`, `reverse_transport`, `football` |
+| 其他 | `buzz_wire`, `dropout`, `sampling`, `dispersion`, `give_way`, `multi_give_way`, `ball_trajectory` |
+
+### 2.3 navigation_static_dynamic_obs 任务详解
+
+本任务基于 `navigation` 扩展，支持可配置的静态 + 动态障碍物，适合测试算法在动态、时变环境中的避障与适应能力。
+
+#### 与其他导航任务的对比
+
+| 特性 | `navigation` | `navigation_obs` | `navigation_dynamic_obs` | `navigation_static_dynamic_obs` |
+|------|--------------|------------------|------------------------|---------------------------------|
+| 障碍物 | 无 | 静态 | 动态 | 静态 + 动态 |
+| 障碍物运动模式 | — | — | 直线往复 / 圆周 / 随机 | 同左 |
+| 智能体动力学 | 全向 | 全向 / 差速 / 自行车 | 全向 | 全向 |
+| 任务目标 | 导航 | 避开静态障碍 | 避开动态障碍 | 避开静态 + 动态障碍 |
+
+#### 配置文件位置
+
+- **任务配置**：`benchmarl/conf/task/vmas/navigation_static_dynamic_obs.yaml`
+- **TaskConfig**：`benchmarl/environments/vmas/navigation_static_dynamic_obs.py`
+- **VMAS 场景**：`vmas/scenarios/navigation_static_dynamic_obs.py`（在 pip 包内）
+
+#### 配置参数说明
+
+```yaml
+# 智能体配置
+n_agents: 3                 # 智能体数量
+agent_radius: 0.1           # 智能体半径
+
+# 障碍物配置
+n_static_obstacles: 2       # 静态障碍物数量
+n_dynamic_obstacles: 0      # 动态障碍物数量
+static_obstacle_radius: 0.15
+dynamic_obstacle_radius: 0.1
+obstacle_modes:             # 动态障碍物运动模式
+  - linear
+  - circular
+  - random
+
+# 动态运动参数
+obstacle_speed: 0.02
+obstacle_linear_range: 0.5
+obstacle_circular_radius: 0.3
+obstacle_random_noise: 0.1
+
+# 世界
+world_spawning_x: 1.0      # spawn 范围 [-1, 1]
+world_spawning_y: 1.0
+
+# 奖励
+agent_collision_penalty: -2.0
+obstacle_collision_penalty: -1.0
+final_reward: 0.01
+shared_rew: False
+```
+
+> **关键事实**：世界边界 `[-1, +1] × [-1, +1]`（2.0×2.0），agent 半径 0.1。在使用 `navigation_avoidance_v2` 时推荐 `--safety-distance 0.25`、`--neighbor-radius 0.5`。
+
+---
+
+## 3. 模型
+
+### 3.1 标准模型
+
+| 模型 | 说明 | 适用场景 |
+|------|------|----------|
+| **MLP** | 多层感知机 | 默认选择 |
+| **Hebbian** | 单层赫布学习层（PPO 训练 ABCD） | 在线自适应 |
+| **FullHebbian** | 全赫布多层网络 | 端到端赫布 |
+| **HanModel** | 赫布吸引子网络（HAN） | 端到端赫布 + 严格边界 |
+| **GRU** | 门控循环单元 | 时序依赖 |
+| **LSTM** | 长短期记忆网络 | 时序依赖 |
+| **GNN** | 图神经网络 | 多智能体通信 |
+| **CNN** | 卷积神经网络 | 视觉输入 |
+| **Deepsets** | 深集合网络 | 置换不变性 |
+
+> 模型文件位于 `benchmarl/models/`，注册入口在 `benchmarl/models/__init__.py`。
+
+### 3.2 Hebbian 系列对比
+
+| 维度 | `HebbianLayer` | `FullHebbianModel` | `HanModel` |
+|------|----------------|-------------------|------------|
+| 层数 | 1 | 3 | 2（单隐层） |
+| 隐层宽度 | 由 `out_features` 决定 | 9（默认） | 18（默认） |
+| forward 是否改 W | ✅ 是 | ✅ 是 | ❌ 否 |
+| 权重更新函数 | 内联 | 内联 | 独立 `update_weights()` |
+| 触发频率 | 每步 | 每步 | `f_NN // f_hebb` 步可配 |
+| 激活值来源 | 瞬时 | 瞬时 | 滑动窗口时间平均 |
+| 权重上限 | `w_max` 软裁剪 | `w_max` 软裁剪 | **逐层硬归一化到 max=1.0** |
+| 优化器 | PPO（CMA-ES 仅在 Phase 2） | CMA-ES（单阶段） | CMA-ES（单阶段） |
+| 适合任务 | 简单在线适应 | 多层抽象 | 难任务（避碰、动态） |
+
+### 3.3 HanModel：赫布吸引子网络
+
+HAN 在传统 HNN 基础上引入三条**严格机制**：
+
+#### 机制 1：推理与权重更新解耦
+- `HanLayer.forward(x)` 只做 `output = x @ W`，**绝不修改 W**。
+- 网络（`HanModel`）维护 `self.ticks` 计数器，每次 `_forward`（即每次环境步）自增 1。
+- 仅当 `ticks % (f_NN // f_hebb) == 0` 时调用 `update_weights()`；否则 **W 严格保持静态**。
+- 若 `f_hebb > f_NN` 或任一为 0，自动禁用更新（不崩溃）。
+
+#### 机制 2：滑动窗口 + 时间平均
+- 每层维护两个 `deque(maxlen=M)`：`pre_window`、`post_window`。
+- `forward()` 只 `deque.append`，**不计算任何 ΔW**。
+- `update_weights()` 内部取 `stack(window).mean(dim=0)` 得 $\overline{x}_{pre}$ / $\overline{x}_{post}$，代入广义 ABCD：
+  $$\Delta w_{ij} = \eta \cdot (a_{ij} \cdot \overline{x}_{pre,j} \cdot \overline{x}_{post,i} + b_{ij} \cdot \overline{x}_{pre,j} + c_{ij} \cdot \overline{x}_{post,i} + d_{ij})$$
+- 更新完成后 **清空 deque**，确保下一 M 步是全新窗口。
+- **绝对禁止使用当前步的瞬时值**做权重更新。
+
+#### 机制 3：逐层硬归一化
+```python
+max_abs = W_new.abs().max()
+if max_abs.item() > 0.0:
+    W_new = W_new / max_abs   # 每层独立除以自己的 max|W|
+```
+- 归一化后，**每层权重矩阵的绝对值最大值严格等于 1.0**。
+- 替代 HNN 原先的 Oja / Weight Decay，既防发散又防萎缩。
+
+#### HanModel 关键 API
+
+| 方法 | 作用 |
+|------|------|
+| `HanModel.ticks` | 当前环境步数（自上次 `reset_all_weights()` 起） |
+| `HanModel._update_interval` | 触发间隔 = `f_NN // f_hebb`；禁用时为 `None` |
+| `HanModel.get_all_han_layers()` | 返回所有 `HanLayer` |
+| `HanModel.get_abcd_vector()` | 把所有层 ABCD 展平成一个向量 |
+| `HanModel.set_abcd_from_vector(v)` | 从向量设置 ABCD |
+| `HanModel.reset_all_weights()` | 重置 W、清空所有 deque、`ticks=0` |
+| `HanLayer.update_weights()` | 用窗口时间平均计算 ΔW 并应用；清空 deque |
+
+#### 端到端使用示例
+
+```python
+import torch
+from torchrl.data import Composite, Unbounded
+from benchmarl.models.han import HanConfig
+
+cfg = HanConfig(
+    hidden_size=18, lr_hebb=0.01, weight_init=1.0,
+    window_size=10, f_nn=4, f_hebb=1,
+    activation_class=torch.nn.Tanh,
+)
+model = cfg.get_model(
+    input_spec=..., output_spec=...,
+    n_agents=2, share_params=True, device="cpu",
+)
+# 推 5 步：内部自动 ticks += 1，并在 ticks%4==0 时触发 update_weights()
+for _ in range(5):
+    td = ...
+    model(td)
+```
+
+---
+
+## 4. 实验配置
+
+所有 PPO 系算法的实验参数统一在 `benchmarl/conf/experiment/` 下。核心通用参数：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -135,7 +314,8 @@ python examples/running/run_ippo_hebbian.py
 | `evaluation_episodes` | 10 | 评估 episodes 数 |
 | `checkpoint_interval` | 0 | 保存检查点间隔 |
 
-#### On-policy 参数 (MAPPO, IPPO)
+### 4.1 On-policy 参数（MAPPO, IPPO, IPPO-Hebbian）
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `on_policy_collected_frames_per_batch` | 6000 | 每次收集的帧数 |
@@ -143,7 +323,8 @@ python examples/running/run_ippo_hebbian.py
 | `on_policy_n_minibatch_iters` | 45 | 每个 batch 的训练轮次 |
 | `on_policy_minibatch_size` | 400 | 小批量大小 |
 
-#### Off-policy 参数 (SAC, DDPG, QMIX 等)
+### 4.2 Off-policy 参数（SAC, DDPG, QMIX 等）
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `off_policy_collected_frames_per_batch` | 6000 | 每次收集的帧数 |
@@ -154,184 +335,224 @@ python examples/running/run_ippo_hebbian.py
 
 ---
 
-## 快速开始
+## 5. 快捷运行命令
 
-### 基本运行命令
+### 5.1 标准 PPO 算法（Hydra 入口）
 
 ```bash
-# 运行 MAPPO + Navigation
+# MAPPO + Navigation
 python benchmarl/run.py algorithm=mappo task=vmas/navigation
 
-# 运行 IPPO + Navigation
+# IPPO + Navigation
 python benchmarl/run.py algorithm=ippo task=vmas/navigation
 
-# 运行 IPPO-Hebbian（两阶段训练，需要自定义网络配置）
-python examples/running/run_ippo_hebbian.py
-
-# 运行 QMIX + SMACv2 (需要离散动作)
+# QMIX + SMACv2
 python benchmarl/run.py algorithm=qmix task=smacv2/terran_5_vs_6
 
 # 多任务对比
 python benchmarl/run.py algorithm=mappo task=vmas/balance,vmas/navigation
-```
 
-> **注意**：IPPO-Hebbian 算法需要自定义网络配置（MLP + Hebbian 层组合），因此使用独立的示例脚本 `examples/running/run_ippo_hebbian.py` 运行，而不是通过 Hydra 命令行。
-
-### 修改训练参数
-
-```bash
-# 修改最大训练帧数
-python benchmarl/run.py algorithm=mappo task=vmas/navigation max_n_frames=5_000_000
-
-# 修改学习率
-python benchmarl/run.py algorithm=mappo task=vmas/navigation lr=0.001
-
-# 修改评估间隔
-python benchmarl/run.py algorithm=mappo task=vmas/navigation evaluation_interval=100_000
-
-# 修改设备
-python benchmarl/run.py algorithm=mappo task=vmas/navigation sampling_device=cpu train_device=cuda
-
-# 禁用视频记录（解决 torchvision 兼容性问题）
-python benchmarl/run.py algorithm=mappo task=vmas/navigation evaluation.save_video=False
-```
-
-### 多参数组合
-
-```bash
+# 多算法 × 多任务 × 多 seed 笛卡尔积
 python benchmarl/run.py \
     algorithm=mappo,qmix,masac \
     task=vmas/balance,vmas/navigation \
     seed=0,1,2
-```
 
-### 使用不同模型
-
-```bash
-# 使用 GNN 模型（适合多智能体通信）
+# 使用不同模型
 python benchmarl/run.py algorithm=mappo task=vmas/navigation model=gnn
-
-# 使用 LSTM
 python benchmarl/run.py algorithm=mappo task=vmas/navigation model=lstm
 ```
 
----
-
-## 训练后操作
-
-### 评估训练好的模型
+### 5.2 IPPO-Hebbian（两阶段训练）
 
 ```bash
-python benchmarl/evaluate.py <checkpoint_path>
+# 默认配置
+python examples/running/run_ippo_hebbian.py
+
+# 动态障碍物版
+python examples/running/run_ippo_hebbian_dynamic_obs.py
 ```
 
-### 恢复中断的训练
+### 5.3 CmaesFullHebbian（CMA-ES 优化 Full HNN）
 
 ```bash
+# 默认训练
+python examples/running/run_cmaes_hebbian.py \
+  --task navigation_static_dynamic_obs \
+  --fitness-mode navigation_v2 \
+  --cmaes-gens 50 --pop-size 30
+
+# 仅评估
+python examples/running/run_cmaes_hebbian.py \
+  --evaluate-only \
+  --experiment-path outputs/<你的实验文件夹> \
+  --fitness-mode navigation_v2 \
+  --n-final-eval 20
+```
+
+### 5.4 CmaesHan（CMA-ES 优化 HAN）
+
+#### 5.4.1 默认训练
+
+```bash
+python examples/running/run_cmaes_han.py \
+  --task navigation_static_dynamic_obs \
+  --fitness-mode navigation_v2 \
+  --hidden-size 18 \
+  --window-size 10 --f-nn 4 --f-hebb 1 \
+  --lr-hebb 0.01 \
+  --cmaes-gens 50 --pop-size 30 --sigma0 0.5 \
+  --n-eval-episodes 3 \
+  --n-final-eval 10 \
+  --max-video-frames 400
+```
+
+#### 5.4.2 含智能体间避碰（navigation_avoidance_v2）
+
+```bash
+# 无环境障碍物 + 智能体间避碰
+python examples/running/run_cmaes_han.py \
+  --task navigation_static_dynamic_obs \
+  --fitness-mode navigation_avoidance_v2 \
+  --n-static-obstacles 0 \
+  --n-dynamic-obstacles 0 \
+  --safety-distance 0.25 \
+  --neighbor-radius 0.5 \
+  --collision-penalty-weight 2.0 \
+  --cmaes-gens 50 --pop-size 30
+```
+
+> **世界尺寸参考**：`navigation_static_dynamic_obs` 的 world 是 `[-1, +1] × [-1, +1]`（2.0×2.0），智能体半径 0.1，3 个智能体。
+> 推荐：`--safety-distance 0.25`（2.5× agent 半径）、`--neighbor-radius 0.5`（25% 地图宽）、`--collision-penalty-weight 2.0`。
+
+#### 5.4.3 仅评估
+
+```bash
+python examples/running/run_cmaes_han.py \
+  --evaluate-only \
+  --experiment-path outputs/<你的实验文件夹> \
+  --fitness-mode navigation_v2 \
+  --hidden-size 18 \
+  --window-size 10 --f-nn 4 --f-hebb 1 \
+  --n-final-eval 20 \
+  --max-video-frames 400
+```
+
+> ⚠️ 评估时 `--hidden-size`、`--window-size`、`--f-nn`、`--f-hebb` 必须与训练时一致，否则 `policy_state.pt` 形状或 deque 长度会失配。
+
+### 5.5 修改训练参数（Hydra）
+
+```bash
+# 最大训练帧数
+python benchmarl/run.py algorithm=mappo task=vmas/navigation max_n_frames=5_000_000
+
+# 学习率
+python benchmarl/run.py algorithm=mappo task=vmas/navigation lr=0.001
+
+# 评估间隔
+python benchmarl/run.py algorithm=mappo task=vmas/navigation evaluation_interval=100_000
+
+# 设备
+python benchmarl/run.py algorithm=mappo task=vmas/navigation sampling_device=cpu train_device=cuda
+
+# 禁用视频记录
+python benchmarl/run.py algorithm=mappo task=vmas/navigation evaluation.save_video=False
+```
+
+### 5.6 评估 / 恢复训练
+
+```bash
+# 评估已训练模型
+python benchmarl/evaluate.py <checkpoint_path>
+
+# 恢复中断的训练
 python benchmarl/resume.py <checkpoint_path>
 ```
 
-### 查看输出结果
+### 5.7 输出位置
 
-训练结果保存在 `outputs/` 目录下：
-- `checkpoints/` - 模型检查点
-- `logs/` - 日志文件
-- `wandb/` - Wandb 日志（如启用）
-- `{experiment_name}.json` - marl-eval 格式结果
+训练结果保存在 `outputs/<experiment_name>/`：
+
+| 文件/目录 | 内容 |
+|-----------|------|
+| `checkpoints/` | 模型检查点 |
+| `logs/` | 训练日志 |
+| `wandb/` | Wandb 日志（如启用） |
+| `*.json` | marl-eval 格式结果 |
+| `han_results/`（HAN 训练）| ABCD 参数 + policy state |
+| `videos_han/`（HAN 评估） | 评估视频 |
 
 ---
 
-## 常见问题
+## 6. 常见问题
 
-### 1. torchvision 版本兼容问题
+### 6.1 torchvision 版本兼容
 
 如果遇到 `AttributeError: module 'torchvision.io' has no attribute 'write_video'`，禁用视频记录：
 
 ```bash
 python benchmarl/run.py algorithm=mappo task=vmas/navigation evaluation.save_video=False
 ```
-或者
 
+### 6.2 CUDA 版本问题
 
-### 2. CUDA 版本问题
-
-如果看到 CUDA 版本警告但仍能运行，可以强制使用 CPU：
+如果看到 CUDA 版本警告但仍能运行，强制使用 CPU：
 
 ```bash
 python benchmarl/run.py algorithm=mappo task=vmas/navigation sampling_device=cpu train_device=cpu
 ```
 
-### 3. Wandb 离线模式
+### 6.3 Wandb 离线模式
 
-如果网络不稳定，使用离线模式：
+网络不稳定时使用离线模式：
 
 ```bash
 python benchmarl/run.py algorithm=mappo task=vmas/navigation loggers=[csv] wandb_extra_kwargs.mode=offline
 ```
 
-### 4. 生成视频过短
+### 6.4 视频过短
+
+1. **增加环境步数**：
+   ```bash
+   python benchmarl/run.py algorithm=mappo task=vmas/navigation task.max_steps=200
+   ```
+   `max_steps` 在 `benchmarl/conf/task/vmas/navigation.yaml` 默认 100。
+
+2. **降低帧率**：
+   ```bash
+   python benchmarl/run.py algorithm=mappo task=vmas/navigation wandb_extra_kwargs.video_fps=10
+   ```
+
+3. **两者结合**：
+   ```bash
+   python benchmarl/run.py algorithm=mappo task=vmas/navigation \
+     task.max_steps=200 wandb_extra_kwargs.video_fps=10
+   ```
+
+### 6.5 IPPO-Hebbian 与 run.py 的关系
+
+`run.py`（Hydra 入口）不支持 IPPO-Hebbian，因为它需要自定义网络配置（MLP + Hebbian 层组合）。必须用独立脚本：
 
 ```bash
-1. 增加环境步数（让 episode 更长）                                                                                                                             
-                
-python benchmarl/run.py algorithm=mappo task=vmas/navigation task.max_steps=200                                                                                
-                                                                                                                                                                
-max_steps 在 benchmarl/conf/task/vmas/navigation.yaml 中默认是 100，改大即可。
-
-
-2. 降低视频帧率（让视频播放更慢）                                                                                                                              
-                
-python benchmarl/run.py algorithm=mappo task=vmas/navigation wandb_extra_kwargs.video_fps=10                                                                   
-                                                                                                                                                                
-默认 FPS 较高，100 步的环境以高帧率播放自然只有 1 秒。降低 FPS 会让同样步数的视频播放更久。                                                                    
-                                                                                                                                                                
-两者结合                                                                                                                                                       
-                
-python benchmarl/run.py algorithm=mappo task=vmas/navigation task.max_steps=200 wandb_extra_kwargs.video_fps=10                                                
-                                                                                                                                                                
-这样视频会同时更长（更多步）和更慢（更低帧率）。
+python examples/running/run_ippo_hebbian.py
 ```
 
-```bash
-● 从代码可以看出，navigation 任务默认没有障碍物。VMAS 的 navigation scenario 位于 pip 包中：                                                                   
-                                                                                                                                                               
-  /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py                                                         
-                                                                                                                                                               
-  如何添加障碍物                                                                                                                                               
-                                                                                                                                                               
-  方案 1：直接修改 vmas 包（简单但不推荐升级包）                                                                                                               
-                                                                                                                                                               
-  # 编辑 /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py
-                                                                                                                                                               
-  在 make_world 方法中，在添加 agents 之后、返回 world 之前添加障碍物：                                                                                        
-                                                                                                                                                               
-  # 在 self.world.add_landmark(goal) 之后添加...                                                                                                               
-                  
-  # 添加障碍物
-  obstacle = Landmark(
-      name="obstacle_1",
-      collide=True,
-      shape=Sphere(radius=0.2),  # 障碍物大小
-      color=(0.5, 0.5, 0.5),
-  )
-  world.add_landmark(obstacle)
-                                                                                                                                                               
-  方案 2：创建自定义任务（推荐）
-                                                                                                                                                               
-  BenchMARL 支持扩展任务。你可以参考 examples/extending/task/ 创建自定义 navigation 任务。
+### 6.6 navigation 任务无障碍物
 
-  方案 3：修改 VMAS 安装目录的 scenario                                                                                                                        
-  
-  # 复制并修改
-  cp /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py \
-  # 复制并修改
-  cp /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py \
-     /your/path/custom_navigation.py
-  # 复制并修改
-  cp /home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios/navigation.py \
-     /your/path/custom_navigation.py
+从代码可见，VMAS 的 `navigation` scenario 默认没有障碍物。如需障碍物，可：
 
-  # 修改后在运行命令中指定
-```
+- **方案 1（不推荐）**：直接修改 vmas 包内 `navigation.py`；
+- **方案 2（推荐）**：使用自定义任务 `navigation_static_dynamic_obs`（详见 §2.3），通过 CLI 调整 `n_static_obstacles` / `n_dynamic_obstacles`；
+- **方案 3**：参考 `examples/extending/task/` 创建自己的 navigation 任务。
 
+### 6.7 CMA-ES 训练的 HAN 评估时参数必须一致
 
+评估时 `--hidden-size`、`--window-size`、`--f-nn`、`--f-hebb` 必须与训练时一致，否则 `policy_state.pt` 的形状对不上，或滑动窗口与触发周期失配。
+
+### 6.8 训练智能体跑出地图
+
+`navigation_static_dynamic_obs` 的世界边界是 `[-1, +1] × [-1, +1]`，默认 ABCD=0 初始化时未训练的网络可能产生极端动作使 agent 飞出地图。这是训练初期的正常现象；CMA-ES 通过 fitness 选择会逐步淘汰这些候选。
+
+### 6.9 inter-agent 碰撞检测依赖绝对位置
+
+HAN 优化器的 inter-agent 碰撞检测通过 VMAS core env 拿 `agent.state.pos`（绝对位置），**不是**用 `obs[:2]`，因为 `obs[:2] = agent.pos - agent.goal`（每个 agent goal 不同，差值不能抵消 goal 偏移）。
