@@ -110,6 +110,8 @@ HAN 是相对 Full HNN 的三机制强化版本。详细机制见 [§3.3](#33-ha
 | `navigation_avoidance` | `episode_reward - λ × collision_count` | 简单加障碍物碰撞惩罚 |
 | `navigation_v2` | `3·progress + 5·success + 1·(-final_dist)` | 推荐默认；分项奖励 |
 | `navigation_avoidance_v2` | `3·progress + 5·success + 1·(-final_dist) - λ · mean(agent_collision_ratios)` | **新增**：含智能体间避碰 |
+| `flocking_global` | `(1/T)·Σ(Cg+S+Ag) + M`，见 [§ 5.4.4.1](#5441-flocking_global--ramos-2019-全局-flocking) | Ramos 2019 Global flocking;梯度弱,推荐 baseline |
+| `flocking_orbit` | `(1/T)·Σ(At+Dt+0.5Cg+0.5S)`，见 [§ 5.4.4.2](#5442-flocking_orbit--绕-target-飞推荐) | **推荐**:绕 target 飞,强梯度,适合 HAN 学习验证 |
 
 `navigation_avoidance_v2` 模式新增参数：
 
@@ -439,6 +441,200 @@ python examples/running/run_cmaes_han.py \
 ```
 
 > ⚠️ 评估时 `--hidden-size`、`--window-size`、`--f-nn`、`--f-hebb` 必须与训练时一致，否则 `policy_state.pt` 形状或 deque 长度会失配。
+> 评估命令也需带上 `--task <与训练时相同>`。例如训练时 `--task flocking`，评估时同样要 `--task flocking`，否则 test_env 会构造不同的 scenario，`policy_state.pt` 输入维度可能失配。
+
+#### 5.4.4 Flocking 任务
+
+`flocking` 任务基于 VMAS 内置的 flocking scenario（`vmas/scenarios/flocking.py`）：4 个 agent 在 `[-1,1]×[-1,1]` 平面里做 holonomic 2D 运动，5 个红色静态障碍物，1 个由 `cos(t/30), sin(t/30)` 驱动的绿色 target。环境本身的奖励是 shaping 形式（与 flocking 任务目标不一致），CMA-ES 通过下面两种 fitness mode 之一重新定义目标函数，**完全脱离 RL 奖励**。
+
+> **关键实现细节（两种 mode 都用到）**：VMAS flocking 的 agent 默认是 Holonomic，`state.rot` 不会被动力学自动更新（永远为 0）。`CmaesHanOptimizer._run_one_episode` 每步后用 `atan2(vel_y, vel_x)` patch `state.rot`，再据此计算朝向角。这是一个**仅读取 + 局部副作用**的小修改，不改 scenario，holonomic 动作空间不变。
+> **世界尺寸参考**：VMAS flocking 的 `x_dim = y_dim = 1.0`，世界是 `[-1, 1] × [-1, 1]`，智能体最大可能位移 ≈ `√2 ≈ 1.414`，target 初始位置 `(0, -1)`。
+
+##### 5.4.4.1 `flocking_global` —— Ramos 2019 全局 flocking
+
+**fitness 公式（Ramos et al. 2019, Global setup, Eq.11）**：
+
+```
+Fg = (1/T) · Σ_t [ Cg(t) + S(t) + Ag(t) ] + M
+```
+
+| 项 | 含义 | 实现 | 范围 |
+|----|------|------|------|
+| `Ag(t)` | 全局对齐 | `| (1/N)·Σ exp(j·θᵢ) |`，θ 由 `atan2(vel_y, vel_x)` 得到 | [0, 1] |
+| `Cg(t)` | 全局内聚 | `1 / 连通分量数`，基于 `neighbor_radius` 无向图 | (0, 1] |
+| `S(t)` | 分离 | `1 - (碰撞 agent 比例)`，判定 `dist < safety_distance` | [0, 1] |
+| `M` | 移动奖励 | `min(平均位移 / movement_target_displacement, 1)` | [0, 1] |
+
+`Fg` 取值范围 `[0, 4]`：4 表示理想 flock（全局对齐 + 单连通分量 + 无碰撞 + 移动达目标），0 表示完全散乱。
+
+**已知问题**：`flocking_global` 对"散向边界(乱飞)"和"群体同向飞"都给 3.0+ 分数，**梯度弱**，CMA-ES 难以区分"真 flocking"和"自由飘飞"（已实测：5 代 CMA-ES 几乎不进步）。适合作为 baseline / 论文复现，不推荐作为 HAN 学习能力验证的首选。
+
+**训练命令**：
+
+```bash
+python examples/running/run_cmaes_han.py \
+  --task flocking \
+  --fitness-mode flocking_global \
+  --hidden-size 18 \
+  --window-size 10 --f-nn 4 --f-hebb 1 \
+  --lr-hebb 0.01 \
+  --neighbor-radius 0.5 \
+  --safety-distance 0.15 \
+  --movement-target-displacement 1.0 \
+  --cmaes-gens 60 --pop-size 30 --sigma0 0.5 \
+  --n-eval-episodes 3 \
+  --n-final-eval 10 \
+  --max-video-frames 400
+```
+
+默认 `neighbor_radius=0.5`、`safety_distance=0.15`、`movement-target-displacement=1.0` 在该世界尺寸下是合理默认，可直接用。
+
+##### 5.4.4.2 `flocking_orbit` —— 绕 target 飞(推荐)
+
+**设计动机**：`flocking_global` 不能区分"自由飘飞"和"绕 target 转圈"。`flocking_orbit` 引入**径向切线对齐**和**距离带**,把"围 target 旋转"直接编码进 fitness,让 CMA-ES 有清晰梯度。
+
+**fitness 公式**：
+
+```
+F_orbit = (1/T) · Σ_t [ At(t) + Dt(t) + 0.5·Cg(t) + 0.5·S(t) ]
+```
+
+| 项 | 含义 | 实现 | 范围 |
+|----|------|------|------|
+| `At(t)` | 径向切线对齐 | 每个 agent 的速度方向 vs (target→agent) CCW 90° 切线;`At = mean( (dot+1)/2 )` | [0, 1] |
+| `Dt(t)` | 距 target 距离带 | `exp(-(d - r*)² / 2σ²)`,r*=`orbit_radius`,σ=`orbit_radius_tolerance`,下限 `dt_floor` | [0, 1] |
+| `Cg(t)` | 全局连通(同 flocking_global) | (0, 1] |
+| `S(t)` | 分离(同 flocking_global) | [0, 1] |
+
+`F_orbit` 取值范围 `[0, 4]`。
+
+**关键差异**(`flocking_orbit` vs `flocking_global`):
+
+| 行为 | `flocking_global` | `flocking_orbit` |
+|------|-------------------|------------------|
+| 散向边界(乱飞) | ~3.0(被误奖) | **~1.7**(被惩罚) |
+| 群体同向飞(不绕圈) | ~3.5(高分) | ~2.0(中分) |
+| 绕 target 转圈 | ~3.5 | **2.6+(高分)** |
+| **梯度跨度** | 0.3(弱) | **1.0+(强)** |
+
+**推荐参数**(适配 VMAS flocking 世界,target 在 `(0,-1)`,agent-to-target 距离典型 1~2):
+- `--orbit-radius 0.7`(agent 距 target 期望距离)
+- `--orbit-radius-tolerance 0.3`(高斯 σ,宽松区间 `[0.4, 1.0]`)
+- `--dt-floor 0.1`(Dt 下限,防止 agent 飘远时信号归零)
+- `--sigma0 0.3`(从 0.5 改 0.3,1584 维 ABCD 空间更细搜索)
+
+**训练命令**：
+
+```bash
+python examples/running/run_cmaes_han.py \
+  --task flocking \
+  --fitness-mode flocking_orbit \
+  --hidden-size 18 \
+  --window-size 10 --f-nn 4 --f-hebb 1 \
+  --lr-hebb 0.01 \
+  --neighbor-radius 0.5 \
+  --safety-distance 0.15 \
+  --orbit-radius 0.7 \
+  --orbit-radius-tolerance 0.3 \
+  --dt-floor 0.1 \
+  --cmaes-gens 30 --pop-size 20 --sigma0 0.3 \
+  --n-eval-episodes 2 \
+  --n-final-eval 10 \
+  --max-video-frames 400 --fps 20
+```
+
+**实测 baseline**(5 代烟雾测试, `pop=12, gens=5`):
+```
+Gen 1: best=1.48, mean=1.26
+Gen 3: best=1.71, mean=1.28
+Gen 5: best=1.65, mean=1.49   ← 仍然在爬升,未收敛
+```
+- 训练结束时 `mean_fitness ≈ 1.7`(乱飞 baseline)
+- 完整 30 代目标 `mean_fitness ≥ 2.0`,收敛 60+ 代目标 `≥ 2.4`
+
+**仅评估(flocking_orbit)**：
+
+```bash
+python examples/running/run_cmaes_han.py \
+  --evaluate-only \
+  --experiment-path outputs/<你的 flocking 实验文件夹> \
+  --task flocking \
+  --fitness-mode flocking_orbit \
+  --hidden-size 18 \
+  --window-size 10 --f-nn 4 --f-hebb 1 \
+  --orbit-radius 0.7 --orbit-radius-tolerance 0.3 --dt-floor 0.1 \
+  --neighbor-radius 0.5 --safety-distance 0.15 \
+  --n-final-eval 10 --max-video-frames 800 --fps 20
+```
+
+##### 5.4.4.3 自定义 target 运动
+
+VMAS flocking 的 target 由 `vmas/scenarios/flocking.py` 的 `action_script_creator()` 驱动,默认走 `cos(t/30), sin(t/30)` 圆周。要自定义 target 运动,用 fork 脚本 `examples/running/run_cmaes_han_flocking_custom.py`,它通过 monkey-patch `vmas.scenarios.load` 在每次 load flocking scenario 后把 `Scenario.action_script_creator` 替换成我们定义的版本。**改 target 运动只需编辑脚本顶部 `custom_target_action_script` 函数体**。
+
+**关键技术点**(实现细节,如不需要改实现可跳过):
+- `vmas/__init__.py` 把 `scenarios` 重赋值为 sorted list,遮蔽子包引用。patch 必须用 `importlib.import_module("vmas.scenarios")` 拿到真子包,才有 `load` 方法。
+- VMAS 每次 `make_env(scenario="flocking")` 都用 `importlib` 重新 exec 一次 scenario 文件,所以必须 wrap `vmas.scenarios.load` 函数而不是只 patch 单个 import 副本。
+- VMAS 调用链:`make_world` 里 `action_script=self.action_script_creator()`(self = Scenario),返回的闭包被存到 `agent._action_script`,每步由 `agent.action_callback` 调成 `agent._action_script(agent, world)`。所以 `custom_target_action_script` 的 `agent` 参数实际上是 target agent(不是 Scenario),Scenario 实例通过 closure 传进来。
+
+**常用 target 运动模板**(替换 `custom_target_action_script` 函数里 `# === EDIT BELOW ===` 那段):
+
+```python
+# 默认: 圆周(VMAS 原版)
+u_x = torch.cos(t)
+u_y = torch.sin(t)
+
+# 静止
+u_x = torch.zeros_like(t)
+u_y = torch.zeros_like(t)
+
+# X 轴来回往复(正弦)
+u_x = torch.sin(t)
+u_y = torch.zeros_like(t)
+
+# 直线匀速 +X
+u_x = torch.ones_like(t)
+u_y = torch.zeros_like(t)
+
+# 椭圆(更慢的 Y 振荡)
+u_x = torch.cos(t)
+u_y = 0.5 * torch.sin(t)
+
+# 更快角速度(×3)
+u_x = torch.cos(t * 3.0)
+u_y = torch.sin(t * 3.0)
+
+# 8 字轨迹
+u_x = torch.sin(t)
+u_y = torch.sin(t * 2.0)
+```
+
+> **物理注意**:VMAS flocking target 默认是 Holonomic dynamics,`u` 是加速度(不是速度)。`u_x=1, u_y=0` 会让 target 缓慢向 +X 加速,400 步累计位移比想象的少。如果想让 target 走出**精确的圆/直线**,需要在公式里乘 `dt` 补偿,或者直接修改 `vmas/scenarios/flocking.py` 把 target 换成 Kinematic dynamics。
+
+**训练命令**(用 custom 脚本):
+
+```bash
+/home/zhaozeming/miniconda3/envs/benchmarl/bin/python \
+  examples/running/run_cmaes_han_flocking_custom.py \
+  --task flocking \
+  --fitness-mode flocking_orbit \
+  --hidden-size 18 \
+  --window-size 10 --f-nn 4 --f-hebb 1 \
+  --lr-hebb 0.01 \
+  --orbit-radius 0.7 --orbit-radius-tolerance 0.3 --dt-floor 0.1 \
+  --neighbor-radius 0.5 --safety-distance 0.15 \
+  --cmaes-gens 30 --pop-size 20 --sigma0 0.3 \
+  --n-eval-episodes 2 \
+  --n-final-eval 10 --max-video-frames 400 --fps 20
+```
+
+> **重要**:评估时 target 运动脚本**必须与训练时一致**,否则 fitness 不可比(同样的 ABCD 在不同 target 轨迹下分数会变)。
+
+##### 5.4.4.4 输出与可观察量(两种 mode 共用)
+
+- 训练中终端打印 `best` 和 `mean` fitness(每代一次)。
+- `--n-final-eval` 个 episode 完成后会打印 `Mean fitness` 与 `Mean reward`(注:reward 是 VMAS 原始 shaping reward,与 fitness mode 不一致,二者解耦)。
+- `outputs/<实验>/han_results/results.json` 里有 `best_fitness`(为 fitness 标量,范围 [0, 4])、`fitness_mode` 等元信息。
+- `outputs/<实验>/videos_han/eval_han_<ep>.mp4` 是带渲染的 rollout 视频,可视检查是否涌现 flocking / 绕圈 行为。
 
 ### 5.5 修改训练参数（Hydra）
 

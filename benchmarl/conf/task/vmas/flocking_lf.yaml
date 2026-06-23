@@ -1,0 +1,13 @@
+defaults:
+  - vmas_flocking_lf_config
+  - _self_
+
+
+max_steps: 800
+n_leaders: 1
+n_followers: 4
+neighbor_radius: 0.5
+target_pos_x: 0.0
+target_pos_y: 0.0
+min_spawn_dist: 0.3
+spawn_radius: 0.9

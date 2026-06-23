@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import time
 
@@ -24,6 +25,9 @@ class CmaesHanOptimizer:
         "navigation_avoidance",
         "navigation_v2",
         "navigation_avoidance_v2",
+        "flocking_global",
+        "flocking_orbit",
+        "flocking_lf_arrival",
     ]
 
     def __init__(
@@ -39,6 +43,11 @@ class CmaesHanOptimizer:
         collision_penalty_weight: float = 2.0,
         safety_distance: float = 0.15,
         neighbor_radius: float = 0.5,
+        movement_target_displacement: float = 1.0,
+        patch_heading_from_vel: bool = True,
+        orbit_radius: float = 0.7,
+        orbit_radius_tolerance: float = 0.3,
+        dt_floor: float = 0.1,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -51,6 +60,11 @@ class CmaesHanOptimizer:
         self.collision_penalty_weight = collision_penalty_weight
         self.safety_distance = safety_distance
         self.neighbor_radius = neighbor_radius
+        self.movement_target_displacement = movement_target_displacement
+        self.patch_heading_from_vel = patch_heading_from_vel
+        self.orbit_radius = orbit_radius
+        self.orbit_radius_tolerance = orbit_radius_tolerance
+        self.dt_floor = dt_floor
 
         self.policy = experiment.policy
 
@@ -89,6 +103,9 @@ class CmaesHanOptimizer:
                          final_goal_dists: torch.Tensor = None,
                          success: bool = False,
                          agent_collision_ratios: torch.Tensor = None,
+                         pos_history=None,
+                         rot_history=None,
+                         target_pos_history=None,
                          ) -> float:
         """Compute fitness value from episode data based on fitness mode.
 
@@ -102,6 +119,13 @@ class CmaesHanOptimizer:
             agent_collision_ratios: (n_agents,) per-agent fraction of steps
                 where the agent was within safety_distance of a neighbor
                 (within neighbor_radius). Used by ``navigation_avoidance_v2``.
+            pos_history: list of (n_agents, 2) CPU tensors, one per step.
+                Required for ``flocking_global`` and ``flocking_orbit``.
+            rot_history: list of (n_agents,) CPU tensors (heading angle in
+                radians, one per agent per step). Required for
+                ``flocking_global`` and ``flocking_orbit``.
+            target_pos_history: list of (2,) CPU tensors (target absolute
+                position per step). Required for ``flocking_orbit``.
         """
         if self.fitness_mode == "navigation":
             return episode_reward
@@ -152,12 +176,292 @@ class CmaesHanOptimizer:
                     + w_success * success_term
                     + w_final * final_term
                     - w_collision * mean_collision_ratio)
+        elif self.fitness_mode == "flocking_global":
+            if pos_history is None or rot_history is None:
+                raise ValueError(
+                    "flocking_global mode requires pos_history and rot_history"
+                )
+            return self._compute_flocking_fitness(pos_history, rot_history)
+        elif self.fitness_mode == "flocking_orbit":
+            if pos_history is None or rot_history is None or target_pos_history is None:
+                raise ValueError(
+                    "flocking_orbit mode requires pos_history, rot_history, "
+                    "and target_pos_history"
+                )
+            return self._compute_flocking_orbit_fitness(
+                pos_history, rot_history, target_pos_history
+            )
+        elif self.fitness_mode == "flocking_lf_arrival":
+            if pos_history is None or target_pos_history is None:
+                raise ValueError(
+                    "flocking_lf_arrival mode requires pos_history and "
+                    "target_pos_history"
+                )
+            return self._compute_flocking_lf_arrival_fitness(
+                pos_history, target_pos_history
+            )
         else:
             raise ValueError(f"Unknown fitness mode: {self.fitness_mode}")
+
+    def _count_connected_components(self, adj: torch.Tensor) -> int:
+        """Count connected components of an undirected adjacency matrix.
+
+        Args:
+            adj: (N, N) bool tensor where adj[i, j] is True if i and j
+                are connected. Diagonal entries are ignored.
+        Returns:
+            Number of connected components (>= 1).
+        """
+        N = adj.shape[0]
+        if N == 0:
+            return 0
+        # Build undirected edges (upper triangular) and run DSU.
+        parent = list(range(N))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Move to CPU once; graph is small.
+        adj_cpu = adj.detach().cpu().bool()
+        iu, iv = torch.triu_indices(N, N, offset=1)
+        edge_mask = adj_cpu[iu, iv]
+        edge_i = iu[edge_mask].tolist()
+        edge_j = iv[edge_mask].tolist()
+        for a, b in zip(edge_i, edge_j):
+            union(a, b)
+
+        roots = {find(x) for x in range(N)}
+        return len(roots)
+
+    def _compute_flocking_fitness(self, pos_history, rot_history) -> float:
+        """Ramos et al. 2019 Global flocking fitness (Eq. 11).
+
+        Fg = (1/T) * sum_t [ Cg(t) + S(t) + Ag(t) ] + M
+
+        Args:
+            pos_history: list of length T with (N, 2) CPU tensors.
+            rot_history: list of length T with (N,) CPU tensors (heading
+                angle in radians, already patched from velocity direction).
+        """
+        if not pos_history:
+            return 0.0
+        T = len(pos_history)
+        # Sanity: every step should have N agents.
+        N = pos_history[0].shape[0]
+        if N < 2:
+            # Degenerate: at most one agent, no cohesion/alignment to compute.
+            Ag = 0.0
+            Cg = 0.0
+            S = 1.0
+            return Ag + Cg + S + 0.0
+
+        fitness_sum = 0.0
+        # Cache neighbor_radius/safety_distance as python floats for speed.
+        nr = float(self.neighbor_radius)
+        sd = float(self.safety_distance)
+        eye = torch.eye(N, dtype=torch.bool)
+
+        for t in range(T):
+            pos = pos_history[t]                            # (N, 2)
+            rot = rot_history[t]                            # (N,)
+
+            # Ag(t) — global alignment order parameter.
+            vx = torch.cos(rot)
+            vy = torch.sin(rot)
+            Ag = torch.sqrt(vx.mean() ** 2 + vy.mean() ** 2).item()
+
+            # Cg(t) — global cohesion via connected components over
+            # the neighbor-radius graph.
+            diff = pos.unsqueeze(0) - pos.unsqueeze(1)      # (N, N, 2)
+            dist = torch.linalg.vector_norm(diff, dim=-1)   # (N, N)
+            adj = (dist < nr) & (~eye)
+            num_groups = CmaesHanOptimizer._count_connected_components(self, adj)
+            Cg = 1.0 / max(int(num_groups), 1)
+
+            # S(t) — separation: 1 - fraction of agents colliding.
+            # Exclude self-pairs (diagonal is 0 and would falsely count as
+            # a collision for every agent).
+            dist_for_collision = dist.masked_fill(eye, float("inf"))
+            in_collision = (dist_for_collision < sd).any(dim=-1)  # (N,)
+            S = 1.0 - in_collision.float().mean().item()
+
+            fitness_sum += Cg + S + Ag
+
+        Fg = fitness_sum / T
+
+        # M — movement bonus from Ramos et al. (avg displacement vs target).
+        d = torch.linalg.vector_norm(
+            pos_history[-1] - pos_history[0], dim=-1
+        ).mean().item()
+        D = float(self.movement_target_displacement)
+        M = min(d / D, 1.0) if D > 0 else 0.0
+
+        return Fg + M
+
+    def _compute_flocking_orbit_fitness(self, pos_history, rot_history,
+                                         target_pos_history) -> float:
+        """Orbit-target flocking fitness.
+
+        Inspired by VMAS flocking's distance-shaping reward and Ramos
+        et al. 2019's global flocking fitness, but biased toward forming
+        an orbit around the moving ``_target`` rather than free flocking.
+
+        F_orbit = (1/T) * sum_t [ At(t) + Dt(t)
+                                  + w_C * Cg(t) + w_S * S(t) ]
+
+        where:
+          At(t)  - radial-tangential alignment. Each agent's velocity
+                   direction is dot-compared against the tangent of the
+                   agent-to-target ray (CCW 90 deg rotation). Agents
+                   flying along the tangent get At ~ 1, agents flying
+                   radially get At ~ 0.5, agents on the wrong tangent
+                   side get At ~ 0.
+          Dt(t)  - Gaussian band around ``orbit_radius`` of the distance
+                   from each agent to the target. Encourages staying on
+                   the orbit rather than crashing into / fleeing the
+                   target.
+          Cg(t)  - global cohesion: 1 / num_connected_components over
+                   the neighbor-radius graph (same as flocking_global).
+          S(t)   - separation: 1 - (fraction of agents colliding).
+
+        Args:
+            pos_history: list of length T with (N, 2) CPU tensors.
+            rot_history: list of length T with (N,) CPU tensors (heading
+                angle per agent, already patched from velocity direction).
+            target_pos_history: list of length T with (2,) CPU tensors
+                (target absolute position at each step).
+        """
+        T = len(pos_history)
+        if T == 0:
+            return 0.0
+        N = pos_history[0].shape[0]
+        if N < 1:
+            return 0.0
+
+        # Weighting: connectivity & separation are softer than the
+        # orbit terms so they don't dominate the fitness.
+        # Adjusted weights (方案 E): stronger At separation, weaker cohesion.
+        w_C = 0.2
+        w_S = 0.8
+        r_star = float(self.orbit_radius)
+        r_sigma = float(self.orbit_radius_tolerance)
+        dt_floor = float(self.dt_floor)
+        nr = float(self.neighbor_radius)
+        sd = float(self.safety_distance)
+        eye = torch.eye(N, dtype=torch.bool)
+        eps = 1e-6
+
+        sum_At = 0.0
+        sum_Dt = 0.0
+        sum_Cg = 0.0
+        sum_S = 0.0
+
+        for t in range(T):
+            pos = pos_history[t]                       # (N, 2)
+            rot = rot_history[t]                       # (N,)
+            tgt = target_pos_history[t]                # (2,)
+
+            # --- At: radial-tangential alignment ---
+            # r_vec: from target to agent (N, 2). Normalize to unit
+            # radial direction.
+            r_vec = pos - tgt                          # (N, 2)
+            r_norm = torch.linalg.vector_norm(r_vec, dim=-1, keepdim=True)
+            r_unit = r_vec / (r_norm + eps)            # (N, 2)
+            # Tangent = CCW 90 deg rotation of r_unit.
+            # rot90_CCW([x, y]) = [-y, x]
+            tangent = torch.stack([-r_unit[:, 1], r_unit[:, 0]], dim=-1)
+            # Agent velocity direction from heading angle.
+            v_dir = torch.stack([torch.cos(rot), torch.sin(rot)], dim=-1)
+            # Dot product along the tangent.
+            dot = (v_dir * tangent).sum(dim=-1)        # (N,)
+            # Map from [-1, 1] -> [0, 1] (clipped) then average.
+            at = ((dot + 1.0) * 0.5).clamp(0.0, 1.0)
+            # If an agent is exactly on the target (r_norm ~= 0), tangent
+            # is undefined: mask it out by setting At contribution to the
+            # neutral 0.5 via r_norm > eps gate.
+            valid = (r_norm.squeeze(-1) > eps).float()
+            at_sum = (at * valid).sum().item()
+            at_count = valid.sum().item()
+            At = at_sum / at_count if at_count > 0 else 0.5
+
+            # --- Dt: Gaussian distance band ---
+            # Higher when r_norm is close to r_star; floored at dt_floor.
+            r_dist = r_norm.squeeze(-1)                # (N,)
+            Dt_raw = torch.exp(-((r_dist - r_star) ** 2) / (2.0 * r_sigma ** 2))
+            Dt = max(Dt_raw.mean().item(), dt_floor)
+
+            # --- Cg: connected components over neighbor graph ---
+            diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+            dist = torch.linalg.vector_norm(diff, dim=-1)
+            adj = (dist < nr) & (~eye)
+            num_groups = CmaesHanOptimizer._count_connected_components(self, adj)
+            Cg = 1.0 / max(int(num_groups), 1)
+
+            # --- S: separation ---
+            dist_for_collision = dist.masked_fill(eye, float("inf"))
+            in_collision = (dist_for_collision < sd).any(dim=-1)
+            S = 1.0 - in_collision.float().mean().item()
+
+            sum_At += At
+            sum_Dt += Dt
+            sum_Cg += Cg
+            sum_S += S
+
+        F_orbit = (1.5 * sum_At + sum_Dt + w_C * sum_Cg + w_S * sum_S) / T
+        # Range: At, Dt, Cg, S each in [0, 1]; weights keep F_orbit in [0, 4].
+        # Adjusted weights: 1.5×At (emphasize tangential alignment), 0.2×Cg
+        # (reduce clustering reward), 0.8×S (strengthen separation penalty).
+        return F_orbit
+
+    def _compute_flocking_lf_arrival_fitness(
+        self, pos_history, target_pos_history
+    ) -> float:
+        """Leader/follower arrival fitness for ``flocking_lf``.
+
+        The agent swarm must converge to a static target landmark. The
+        target is visible only to leader agents; followers must rely on
+        reaching the target via information propagation through HAN.
+
+        Fitness = -mean_over_agents(final_dist_to_target)
+        (i.e. the optimizer *minimizes* mean final distance; the sign
+        flip in ``fitness()`` flips it back to a positive fitness value
+        that grows as agents get closer to the target).
+
+        Args:
+            pos_history: list of length T with (N, 2) CPU tensors.
+            target_pos_history: list of length T with (2,) CPU tensors
+                (target absolute position per step; constant for
+                ``flocking_lf`` since the target is a static landmark).
+        """
+        T = len(pos_history)
+        if T == 0:
+            return 0.0
+        final_pos = pos_history[-1]                   # (N, 2)
+        final_target = target_pos_history[-1]         # (2,)
+        # Per-agent distance to target at episode end.
+        dist = torch.linalg.vector_norm(
+            final_pos - final_target.unsqueeze(0), dim=-1
+        )                                             # (N,)
+        mean_final_dist = dist.mean().item()
+        # Higher fitness = closer to target (sign flipped in fitness()).
+        return -mean_final_dist
 
     def _run_one_episode(self, env, group, max_steps, policy, on_frame=None):
         """Run a single episode and return everything needed by any fitness mode."""
         td = env.reset()
+
+        # Ensure the vmas core reference is resolved. Normally cached
+        # lazily inside fitness() before the rollout loop, but the
+        # evaluate-only entry path can call _run_one_episode directly.
+        self._get_vmas_core()
 
         obs = td.get((group, "observation"))
         initial_goal_dists = torch.linalg.vector_norm(
@@ -175,6 +479,15 @@ class CmaesHanOptimizer:
         # Shape: (n_agents,). Set up after we observe the first batch.
         agent_collision_steps = None
         n_agents = None
+
+        # Per-step absolute positions (N, 2) and heading angles (N,) on
+        # CPU. Only populated when flocking_global fitness mode is active;
+        # the per-step cost is tiny (N ~ 4..10, T ~ 100..300) so we
+        # always allocate to keep _run_one_episode uniform.
+        pos_history = []
+        rot_history = []  # type: list[torch.Tensor]
+        target_pos_history = []  # type: list[torch.Tensor]
+        initial_pos = None
 
         while not done and step < max_steps:
             td = policy(td)
@@ -222,6 +535,36 @@ class CmaesHanOptimizer:
                 agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (a,)
                 agent_collision_steps += agent_in_collision.float()
 
+                # Flocking fitness bookkeeping: patch each agent's heading
+                # from its current velocity direction (VMAS Holonomic does
+                # not update state.rot automatically), then record per-step
+                # absolute position + heading for later aggregation.
+                if self.patch_heading_from_vel:
+                    for agent in core.agents:
+                        vel0 = agent.state.vel[0]                # (2,)
+                        # atan2(vy, vx) → scalar; assign into rot[0, 0]
+                        # which is shape (batch_dim, 1).
+                        agent.state.rot[0, 0] = torch.atan2(
+                            vel0[1], vel0[0]
+                        )
+                pos_cpu = pos_stack.detach().cpu()
+                rot_cpu = torch.stack(
+                    [a.state.rot[0, 0] for a in core.agents], dim=0
+                ).detach().cpu()
+                if initial_pos is None:
+                    initial_pos = pos_cpu.clone()
+                pos_history.append(pos_cpu)
+                rot_history.append(rot_cpu)
+
+                # Record target absolute position (env index 0) for
+                # flocking_orbit. The target is the action_script-driven
+                # agent attached to the VMAS flocking scenario.
+                target = getattr(getattr(core, "scenario", None), "_target", None)
+                if target is not None and hasattr(target.state, "pos"):
+                    target_pos_history.append(
+                        target.state.pos[0].detach().cpu()
+                    )
+
             done = td.get(("next", "done")).any().item()
             if done:
                 success = True
@@ -249,6 +592,10 @@ class CmaesHanOptimizer:
             "initial_goal_dists": initial_goal_dists,
             "final_goal_dists": final_goal_dists,
             "agent_collision_ratios": agent_collision_ratios,
+            "pos_history": pos_history,
+            "rot_history": rot_history,
+            "target_pos_history": target_pos_history,
+            "initial_pos": initial_pos,
         }
 
     def fitness(self, x: np.ndarray) -> float:
@@ -276,6 +623,9 @@ class CmaesHanOptimizer:
                     final_goal_dists=stats["final_goal_dists"],
                     success=stats["success"],
                     agent_collision_ratios=stats["agent_collision_ratios"],
+                    pos_history=stats["pos_history"],
+                    rot_history=stats["rot_history"],
+                    target_pos_history=stats["target_pos_history"],
                 )
                 fitnesses.append(ep_fitness)
 
@@ -375,6 +725,10 @@ class CmaesHanOptimizer:
             return
 
         data = np.loadtxt(fit_path, comments="%")
+        # np.loadtxt returns a 1-D array when the file has a single row
+        # (e.g. max_gens=1). Normalize to 2-D so column indexing works.
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
         gen = data[:, 0]
         bestever = data[:, 4]
         best = data[:, 5]
@@ -519,6 +873,9 @@ class CmaesHanOptimizer:
                     final_goal_dists=stats["final_goal_dists"],
                     success=stats["success"],
                     agent_collision_ratios=stats["agent_collision_ratios"],
+                    pos_history=stats["pos_history"],
+                    rot_history=stats["rot_history"],
+                    target_pos_history=stats["target_pos_history"],
                 )
                 all_fitnesses.append(ep_fitness)
 

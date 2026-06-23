@@ -25,7 +25,11 @@ def parse_args():
         help="Fitness function mode. 'navigation_avoidance_v2' adds "
              "inter-agent collision penalty based on per-agent collision "
              "ratios (fraction of steps each agent spent within "
-             "safety_distance of a neighbor within neighbor_radius).",
+             "safety_distance of a neighbor within neighbor_radius). "
+             "'flocking_global' implements Ramos 2019 Global flocking "
+             "(alignment + cohesion + separation). 'flocking_orbit' "
+             "adds a target-orbit term (radial-tangential alignment + "
+             "distance band around orbit_radius).",
     )
     parser.add_argument(
         "--collision-penalty-weight",
@@ -56,8 +60,10 @@ def parse_args():
         "--task",
         type=str,
         default="navigation_static_dynamic_obs",
-        choices=["navigation_static_dynamic_obs", "navigation_dynamic_obs"],
-        help="VMAS task to use",
+        choices=["navigation_static_dynamic_obs", "navigation_dynamic_obs", "flocking"],
+        help="VMAS task to use. 'flocking' uses VMAS's built-in flocking "
+             "scenario; pair with --fitness-mode flocking_global or "
+             "flocking_orbit.",
     )
     parser.add_argument(
         "--n-static-obstacles",
@@ -72,9 +78,45 @@ def parse_args():
         default=0,
         help="Number of dynamic obstacles. Set to 0 to disable.",
     )
+    parser.add_argument(
+        "--movement-target-displacement",
+        type=float,
+        default=1.0,
+        help="Target average displacement (in VMAS world units) used to "
+             "compute the movement bonus M in the flocking_global fitness. "
+             "Default 1.0 is a reasonable scale for the VMAS flocking world "
+             "(x_dim=y_dim=1, max possible displacement ~sqrt(2)).",
+    )
+    parser.add_argument(
+        "--orbit-radius",
+        type=float,
+        default=0.7,
+        help="Target radius (VMAS world units) of the orbit each agent "
+             "should keep around the flocking target. Used by the "
+             "'flocking_orbit' fitness as the center of the Gaussian "
+             "distance band Dt. Default 0.7 fits the VMAS flocking world "
+             "(agent-to-target distance is typically 1..2 with target at "
+             "(0,-1)).",
+    )
+    parser.add_argument(
+        "--orbit-radius-tolerance",
+        type=float,
+        default=0.3,
+        help="Standard deviation (VMAS world units) of the Gaussian "
+             "distance band Dt in 'flocking_orbit'. Larger = more "
+             "lenient (agents can stray further from orbit_radius).",
+    )
+    parser.add_argument(
+        "--dt-floor",
+        type=float,
+        default=0.1,
+        help="Lower bound for Dt in 'flocking_orbit'. Prevents the "
+             "distance term from going to zero when all agents are far "
+             "from orbit_radius (keeps some signal flowing back to CMA-ES).",
+    )
 
     # CMA-ES parameters
-    parser.add_argument("--cmaes-gens", type=int, default=60, help="CMA-ES generations")
+    parser.add_argument("--cmaes-gens", type=int, default=15, help="CMA-ES generations")
     parser.add_argument("--pop-size", type=int, default=30, help="CMA-ES population size")
     parser.add_argument("--sigma0", type=float, default=0.5, help="CMA-ES initial step size")
     parser.add_argument("--n-eval-episodes", type=int, default=3, help="Episodes per fitness evaluation")
@@ -82,7 +124,7 @@ def parse_args():
     # HAN network parameters
     parser.add_argument("--hidden-size", type=int, default=18, help="Hidden layer size (single hidden layer)")
     parser.add_argument("--lr-hebb", type=float, default=0.01, help="Hebbian learning rate")
-    parser.add_argument("--weight-init", type=float, default=1.0, help="Weight initialization scale")
+    parser.add_argument("--weight-init", type=float, default=0.1, help="Weight initialization scale")
     parser.add_argument("--window-size", type=int, default=10,
                         help="Sliding-window length M for time-averaged ABCD update")
     parser.add_argument("--f-nn", type=int, default=4,
@@ -108,6 +150,8 @@ def _get_task():
         task = VmasTask.NAVIGATION_STATIC_DYNAMIC_OBS.get_from_yaml()
     elif args.task == "navigation_dynamic_obs":
         task = VmasTask.NAVIGATION_DYNAMIC_OBS.get_from_yaml()
+    elif args.task == "flocking":
+        task = VmasTask.FLOCKING.get_from_yaml()
     else:
         raise ValueError(f"Unknown task: {args.task}")
     # Apply obstacle-count overrides via task.config dict.
@@ -222,6 +266,13 @@ if __name__ == "__main__":
             max_gens=0,
             n_eval_episodes=1,
             device=experiment.config.train_device,
+            collision_penalty_weight=args.collision_penalty_weight,
+            safety_distance=args.safety_distance,
+            neighbor_radius=args.neighbor_radius,
+            movement_target_displacement=args.movement_target_displacement,
+            orbit_radius=args.orbit_radius,
+            orbit_radius_tolerance=args.orbit_radius_tolerance,
+            dt_floor=args.dt_floor,
         )
         if abcd_path.exists():
             optimizer._best_abcd_so_far = np.load(str(abcd_path))
@@ -262,6 +313,10 @@ if __name__ == "__main__":
             collision_penalty_weight=args.collision_penalty_weight,
             safety_distance=args.safety_distance,
             neighbor_radius=args.neighbor_radius,
+            movement_target_displacement=args.movement_target_displacement,
+            orbit_radius=args.orbit_radius,
+            orbit_radius_tolerance=args.orbit_radius_tolerance,
+            dt_floor=args.dt_floor,
         )
 
         best_abcd = optimizer.run()
