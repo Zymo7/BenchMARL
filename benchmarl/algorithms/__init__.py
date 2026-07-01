@@ -11,6 +11,7 @@ from .ippo import Ippo, IppoConfig
 from .ippo_hebbian import IppoHebbian, IppoHebbianConfig
 from .cmaes_hebbian import CmaesHebbian, CmaesHebbianConfig
 from .cmaes_han import CmaesHan, CmaesHanConfig
+from .cmaes_static_mlp import CmaesStaticMlp, CmaesStaticMlpConfig
 from .iql import Iql, IqlConfig
 from .isac import Isac, IsacConfig
 from .maddpg import Maddpg, MaddpgConfig
@@ -30,6 +31,8 @@ classes = [
     "CmaesHebbianConfig",
     "CmaesHan",
     "CmaesHanConfig",
+    "CmaesStaticMlp",
+    "CmaesStaticMlpConfig",
     "IppoConfig",
     "Iql",
     "IqlConfig",
@@ -55,6 +58,7 @@ algorithm_config_registry = {
     "ippo_hebbian": IppoHebbianConfig,
     "cmaes_hebbian": CmaesHebbianConfig,
     "cmaes_han": CmaesHanConfig,
+    "cmaes_static_mlp": CmaesStaticMlpConfig,
     "maddpg": MaddpgConfig,
     "iddpg": IddpgConfig,
     "masac": MasacConfig,

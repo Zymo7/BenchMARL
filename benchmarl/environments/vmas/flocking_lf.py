@@ -17,3 +17,7 @@ class TaskConfig:
     target_pos_y: float = MISSING
     min_spawn_dist: float = MISSING
     spawn_radius: float = MISSING
+    clustered_spawn: bool = MISSING
+    spawn_cluster_center_x: float = MISSING
+    spawn_cluster_center_y: float = MISSING
+    spawn_cluster_radius: float = MISSING

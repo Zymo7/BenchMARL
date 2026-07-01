@@ -107,6 +107,7 @@ class VmasTask(Task):
     BUZZ_WIRE = None
     FLOCKING = None
     FLOCKING_LF = None
+    FLOCKING_LIGHT = None
     DISCOVERY = None
     FOOTBALL = None
     SIMPLE_ADVERSARY = None

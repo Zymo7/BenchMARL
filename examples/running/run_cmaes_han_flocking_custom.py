@@ -21,160 +21,21 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# --------------------------------------------------------------------------
-# Monkey-patch: replace the VMAS flocking scenario's target motion BEFORE
-# VmasClass imports/uses the scenario. This must happen at import time of
-# this script (which is before VmasTask.FLOCKING.get_from_yaml()).
-# --------------------------------------------------------------------------
-# Mechanism: VMAS's vmas.scenarios.load() re-executes the scenario file via
-# importlib every time make_env(scenario="flocking") is called. So patching
-# a one-off imported copy of the module has no effect. We instead wrap the
-# `load` function so that, after it loads flocking.py, we override the
-# Scenario.action_script_creator to use our custom closure.
-#
-# IMPORTANT: `vmas/__init__.py` reassigns `scenarios` to a sorted list of
-# scenario names, shadowing the subpackage. We must use
-# `importlib.import_module('vmas.scenarios')` to get the real subpackage
-# (which has `load`); the `vmas.scenarios` attribute itself is a list
-# after `vmas/__init__.py` finishes loading.
-import importlib
-import vmas  # noqa: F401 — triggers vmas.__init__, vmas.scenarios = list
+# Apply the shared VMAS flocking monkey-patches (stationary + centered
+# target + nearest-neighbor observation). These patches MUST match the
+# disturbance-eval script's, so they live in a shared module.
+from flocking_patch import configure as _flocking_patch_configure  # noqa: F401
 
-_vmas_scenarios_pkg = importlib.import_module("vmas.scenarios")
-_original_load = _vmas_scenarios_pkg.load
-
-
-def _patched_load(name):
-    module = _original_load(name)
-    if name == "flocking.py" or name == "flocking":
-        # Replace action_script_creator with a function returning our
-        # custom action script. Matches the original VMAS calling
-        # convention: self.action_script_creator() → action_script.
-        module.Scenario.action_script_creator = _patched_action_script_creator
-        # Replace reset_world_at so the target's INITIAL position is
-        # set to (--target-pos-x, --target-pos-y) instead of the VMAS
-        # default (0, -y_dim). The default places the target at the
-        # bottom edge of the world and biases the flocking orbit
-        # asymmetrically. The original VMAS reset_world_at is also
-        # responsible for spawning random agent positions, obstacle
-        # positions, distance shaping, etc.; we keep all that logic and
-        # only override the target_pos initialization.
-        module.Scenario.reset_world_at = _patched_reset_world_at
-    return module
-
-
-def _patched_reset_world_at(self, env_index=None):
-    """Like the original VMAS flocking reset_world_at, but with the
-    target's initial position replaced by (TARGET_POS_X, TARGET_POS_Y).
-
-    Reads module-level ``_TARGET_POS_X`` / ``_TARGET_POS_Y`` so it can be
-    configured from CLI args.
-    """
-    # Lazy-import the same constants the original uses, so all other
-    # behaviour (spawning, distance shaping, lidar init) is unchanged.
-    from vmas.simulator.utils import ScenarioUtils, Y, X  # noqa: F401
-    import torch as _torch
-
-    target_pos = _torch.zeros(
-        (
-            (1, self.world.dim_p)
-            if env_index is not None
-            else (self.world.batch_dim, self.world.dim_p)
-        ),
-        device=self.world.device,
-        dtype=_torch.float32,
-    )
-    target_pos[:, X] = _TARGET_POS_X
-    target_pos[:, Y] = _TARGET_POS_Y
-    self._target.set_pos(target_pos, batch_index=env_index)
-    ScenarioUtils.spawn_entities_randomly(
-        self.obstacles + self.world.policy_agents,
-        self.world,
-        env_index,
-        self._min_dist_between_entities,
-        x_bounds=(-self.x_dim, self.x_dim),
-        y_bounds=(-self.y_dim, self.y_dim),
-        occupied_positions=target_pos.unsqueeze(1),
-    )
-
-    for agent in self.world.policy_agents:
-        if env_index is None:
-            agent.distance_shaping = (
-                _torch.stack(
-                    [
-                        _torch.linalg.vector_norm(
-                            agent.state.pos - a.state.pos, dim=-1
-                        )
-                        for a in self.world.agents
-                        if a != agent
-                    ],
-                    dim=1,
-                )
-                - self.desired_distance
-            ).pow(2).mean(-1) * self.dist_shaping_factor
-        else:
-            agent.distance_shaping[env_index] = (
-                _torch.stack(
-                    [
-                        _torch.linalg.vector_norm(
-                            agent.state.pos[env_index] - a.state.pos[env_index]
-                        )
-                        for a in self.world.agents
-                        if a != agent
-                    ],
-                    dim=0,
-                )
-                - self.desired_distance
-            ).pow(2).mean(-1) * self.dist_shaping_factor
-
-    if env_index is None:
-        self.t = _torch.zeros(self.world.batch_dim, device=self.world.device)
-    else:
-        self.t[env_index] = 0
-
-
-_vmas_scenarios_pkg.load = _patched_load
-# --------------------------------------------------------------------------
-# End monkey-patch. Now safe to import everything else.
-# --------------------------------------------------------------------------
 
 
 
 
 def custom_target_action_script(agent, world, scenario_self):
-    """The action script called by VMAS every env step. Set
-    ``agent.action.u`` to the (2,) velocity (or force) you want the target
-    to take this step.
-
-    Args:
-        agent: the target Agent whose action we set.
-        world: the VMAS World (unused by default).
-        scenario_self: the VMAS Scenario instance — its ``t`` attribute
-            is the step counter (incremented in the scenario's reward()).
+    """DEPRECATED: target motion is now configured via flocking_patch.
+    Kept only as a hook if you want to experiment with non-stationary
+    motion; edit flocking_patch._stationary_action_script to change it.
     """
-    t = scenario_self.t / 30.0  # original scaling; matches VMAS flocking default
-    # === EDIT BELOW to change target motion ===
-    # SANITY-CHECK: keep target STATIONARY at its initial position (0, -1).
-    u_x = torch.zeros_like(t)
-    u_y = torch.zeros_like(t)
-    # === END EDIT ===
-    agent.action.u = torch.stack([u_x, u_y], dim=1)
-
-
-# Mirrors the original VMAS flocking signature:
-#   def action_script_creator(self):
-#       def action_script(agent, world):
-#           t = self.t / 30
-#           agent.action.u = ...
-#       return action_script
-# VMAS calls `self.action_script_creator()` (with self = Scenario instance)
-# inside make_world(), then uses the returned closure as the agent's
-# action_script. The closure captures self = Scenario. We replicate the
-# pattern but delegate to custom_target_action_script for clarity.
-def _patched_action_script_creator(self):
-    def action_script(agent, world):
-        custom_target_action_script(agent, world, self)
-    return action_script
+    pass
 
 
 from benchmarl.algorithms.cmaes_han import CmaesHanConfig
@@ -211,12 +72,15 @@ def parse_args():
     parser.add_argument("--orbit-radius-tolerance", type=float, default=0.3)
     parser.add_argument("--dt-floor", type=float, default=0.1)
 
-    parser.add_argument("--cmaes-gens", type=int, default=40)
-    parser.add_argument("--pop-size", type=int, default=40)
+    parser.add_argument("--cmaes-gens", type=int, default=30)
+    parser.add_argument("--pop-size", type=int, default=30)
     parser.add_argument("--sigma0", type=float, default=0.3)
     parser.add_argument("--n-eval-episodes", type=int, default=2)
 
-    parser.add_argument("--hidden-size", type=int, default=18)
+    parser.add_argument("--hidden-size", type=int, default=10,
+                        help="HAN hidden layer size. Default 10 matches "
+                             "the 10-dim flocking observation "
+                             "(pos+vel+target_rel+nn_rel_pos+nn_rel_vel).")
     parser.add_argument("--lr-hebb", type=float, default=0.01)
     parser.add_argument("--weight-init", type=float, default=0.1)
     parser.add_argument("--window-size", type=int, default=10)
@@ -242,10 +106,22 @@ def parse_args():
 
 args = parse_args()
 
-# Module-level constants read by _patched_reset_world_at. Set after
-# args is parsed so CLI overrides flow through.
-_TARGET_POS_X = args.target_pos_x
-_TARGET_POS_Y = args.target_pos_y
+# Configure the shared flocking monkey-patches with CLI values. MUST
+# match what the disturbance-eval script configures so that the trained
+# observation layout (10-dim, nearest-neighbor pos+vel) is identical.
+_flocking_patch_configure(
+    target_pos_x=args.target_pos_x,
+    target_pos_y=args.target_pos_y,
+    neighbor_radius=args.neighbor_radius,
+)
+
+# Validate hidden-size matches the observation dim (10 for nn mode).
+_expected_obs_dim = 10
+if args.hidden_size != _expected_obs_dim:
+    print(f"WARNING: --hidden-size {args.hidden_size} does not match "
+          f"expected {_expected_obs_dim} for the 10-dim nn observation. "
+          f"Auto-correcting to {_expected_obs_dim}.")
+    args.hidden_size = _expected_obs_dim
 
 
 def _get_task():
@@ -290,6 +166,7 @@ def _setup_experiment_for_cmaes(task, model_config, critic_model_config, output_
     experiment_config = ExperimentConfig.get_from_yaml()
     experiment_config.max_n_iters = 1
     experiment_config.save_folder = str(output_dir)
+    experiment_config.loggers = []  # Disable wandb logging to speed up training
     experiment = Experiment(
         task=task,
         algorithm_config=CmaesHanConfig.get_from_yaml(),
@@ -314,8 +191,9 @@ if __name__ == "__main__":
     print("CMA-ES HAN — Flocking with CUSTOM target motion")
     print("=" * 60)
     print(f"Task: {args.task} | fitness_mode: {args.fitness_mode}")
-    print(f"Patched action_script_creator: "
-          f"{_patched_action_script_creator.__qualname__}")
+    print(f"Flocking patch: stationary target @ "
+          f"({args.target_pos_x}, {args.target_pos_y}), "
+          f"neighbor_radius={args.neighbor_radius}, obs=10-dim (nn pos+vel)")
     print(f"orbit_radius={args.orbit_radius}, "
           f"orbit_radius_tolerance={args.orbit_radius_tolerance}, "
           f"dt_floor={args.dt_floor}")

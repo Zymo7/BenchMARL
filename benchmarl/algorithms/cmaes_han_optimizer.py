@@ -28,6 +28,7 @@ class CmaesHanOptimizer:
         "flocking_global",
         "flocking_orbit",
         "flocking_lf_arrival",
+        "flocking_light_intensity",
     ]
 
     def __init__(
@@ -198,6 +199,15 @@ class CmaesHanOptimizer:
                     "target_pos_history"
                 )
             return self._compute_flocking_lf_arrival_fitness(
+                pos_history, target_pos_history
+            )
+        elif self.fitness_mode == "flocking_light_intensity":
+            if pos_history is None or target_pos_history is None:
+                raise ValueError(
+                    "flocking_light_intensity mode requires pos_history "
+                    "and target_pos_history"
+                )
+            return self._compute_flocking_light_intensity_fitness(
                 pos_history, target_pos_history
             )
         else:
@@ -453,6 +463,45 @@ class CmaesHanOptimizer:
         mean_final_dist = dist.mean().item()
         # Higher fitness = closer to target (sign flipped in fitness()).
         return -mean_final_dist
+
+    def _compute_flocking_light_intensity_fitness(
+        self, pos_history, target_pos_history
+    ) -> float:
+        """Time-averaged light-intensity fitness for ``flocking_light``.
+
+        Φ(pos) = 1 / (||pos - target|| + ε)
+
+        Fitness = mean_over_time( mean_over_agents( Φ(pos_t) ) )
+
+        Rewarding the instantaneous field value at every step (rather
+        than only the final distance) means the swarm is encouraged to
+        move toward the target quickly AND stay there — no late-episode
+        surge can game it. ``ε`` is read from the scenario so this stays
+        consistent with the field the agents actually observe.
+
+        Args:
+            pos_history: list of length T with (N, 2) CPU tensors.
+            target_pos_history: list of length T with (2,) CPU tensors.
+        """
+        T = len(pos_history)
+        if T == 0:
+            return 0.0
+        eps = 0.01
+        core = self._get_vmas_core()
+        scenario = getattr(core, "scenario", None)
+        if scenario is not None:
+            eps = float(getattr(scenario, "light_eps", eps))
+
+        intensity_sum = 0.0
+        for t in range(T):
+            pos = pos_history[t]                    # (N, 2)
+            target = target_pos_history[t]          # (2,)
+            dist = torch.linalg.vector_norm(
+                pos - target.unsqueeze(0), dim=-1
+            )                                       # (N,)
+            intensity = 1.0 / (dist + eps)          # (N,)
+            intensity_sum += intensity.mean().item()
+        return intensity_sum / T
 
     def _run_one_episode(self, env, group, max_steps, policy, on_frame=None):
         """Run a single episode and return everything needed by any fitness mode."""

@@ -31,7 +31,7 @@ def parse_args():
     )
 
     # Task parameters
-    parser.add_argument("--n-leaders", type=int, default=0)
+    parser.add_argument("--n-leaders", type=int, default=1)
     parser.add_argument("--n-followers", type=int, default=4)
     parser.add_argument(
         "--neighbor-radius", type=float, default=0.5,
@@ -42,7 +42,16 @@ def parse_args():
     parser.add_argument("--target-pos-y", type=float, default=0.0)
     parser.add_argument("--min-spawn-dist", type=float, default=0.3)
     parser.add_argument("--spawn-radius", type=float, default=0.9)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument(
+        "--clustered-spawn", action="store_true",
+        help="Spawn all agents clustered in a disc instead of the "
+             "annulus around target. Used for evaluation with fixed "
+             "initial configuration.",
+    )
+    parser.add_argument("--spawn-cluster-center-x", type=float, default=0.5)
+    parser.add_argument("--spawn-cluster-center-y", type=float, default=0.0)
+    parser.add_argument("--spawn-cluster-radius", type=float, default=0.15)
+    parser.add_argument("--max-steps", type=int, default=1600)
 
     # Fitness mode
     parser.add_argument(
@@ -53,13 +62,13 @@ def parse_args():
     )
 
     # CMA-ES parameters
-    parser.add_argument("--cmaes-gens", type=int, default=15)
+    parser.add_argument("--cmaes-gens", type=int, default=30)
     parser.add_argument("--pop-size", type=int, default=30)
     parser.add_argument("--sigma0", type=float, default=0.3)
     parser.add_argument("--n-eval-episodes", type=int, default=2)
 
-    # HAN network parameters
-    parser.add_argument("--hidden-size", type=int, default=18)
+    # HAN network parameters (input is 6 dims: is_leader + target_rel + nn_rel + nn_dist)
+    parser.add_argument("--hidden-size", type=int, default=6)
     parser.add_argument("--lr-hebb", type=float, default=0.01)
     parser.add_argument("--weight-init", type=float, default=0.1)
     parser.add_argument("--window-size", type=int, default=10)
@@ -97,6 +106,10 @@ def _get_task():
     task.config["target_pos_y"] = args.target_pos_y
     task.config["min_spawn_dist"] = args.min_spawn_dist
     task.config["spawn_radius"] = args.spawn_radius
+    task.config["clustered_spawn"] = args.clustered_spawn
+    task.config["spawn_cluster_center_x"] = args.spawn_cluster_center_x
+    task.config["spawn_cluster_center_y"] = args.spawn_cluster_center_y
+    task.config["spawn_cluster_radius"] = args.spawn_cluster_radius
     task.config["max_steps"] = args.max_steps
     return task
 
@@ -151,8 +164,13 @@ if __name__ == "__main__":
     print(f"Task: flocking_lf | n_leaders={args.n_leaders}, n_followers={args.n_followers}")
     print(f"  neighbor_radius={args.neighbor_radius}, "
           f"target=({args.target_pos_x}, {args.target_pos_y})")
-    print(f"  spawn: annulus [{args.min_spawn_dist}, {args.spawn_radius}] "
-          f"around target, max_steps={args.max_steps}")
+    if args.clustered_spawn:
+        print(f"  spawn: CLUSTERED at ({args.spawn_cluster_center_x}, "
+              f"{args.spawn_cluster_center_y}), "
+              f"radius={args.spawn_cluster_radius}, max_steps={args.max_steps}")
+    else:
+        print(f"  spawn: annulus [{args.min_spawn_dist}, {args.spawn_radius}] "
+              f"around target, max_steps={args.max_steps}")
     print(f"Fitness mode: {args.fitness_mode}")
     print(f"HAN: hidden={args.hidden_size}, window={args.window_size}, "
           f"f_nn={args.f_nn}, f_hebb={args.f_hebb}")

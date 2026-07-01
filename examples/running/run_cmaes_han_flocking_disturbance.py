@@ -23,7 +23,7 @@ Usage:
         --experiment-path outputs/<your flocking experiment> \\
         --fitness-mode flocking_orbit \\
         --disturbance-step 400 --frozen-agent-idx 2 \\
-        --hidden-size 18 --window-size 10 --f-nn 4 --f-hebb 1 \\
+        --hidden-size 10 --window-size 10 --f-nn 4 --f-hebb 1 \\
         --orbit-radius 0.7 --orbit-radius-tolerance 0.3 --dt-floor 0.1 \\
         --neighbor-radius 0.5 --safety-distance 0.15
 """
@@ -39,48 +39,11 @@ import torch
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 # --------------------------------------------------------------------------
-# Monkey-patch: replace the VMAS flocking scenario's target motion to
-# match the training environment (STATIONARY target at (0, -1)).
-# Same mechanism as run_cmaes_han_flocking_custom.py — wrap
-# vmas.scenarios.load so that, after each flocking scenario is loaded,
-# the Scenario.action_script_creator is replaced with our stationary
-# version. Without this, evaluation would use the default
-# cos(t/30), sin(t/30) circular motion, which is INCONSISTENT with
-# training and breaks the comparison.
-# --------------------------------------------------------------------------
-import importlib
-import vmas  # noqa: F401 — triggers vmas.__init__, vmas.scenarios = list
-
-_vmas_scenarios_pkg = importlib.import_module("vmas.scenarios")
-_original_load = _vmas_scenarios_pkg.load
-
-
-def _stationary_action_script(agent, world, scenario_self):
-    """Stationary target (matches the training environment)."""
-    # agent.action.u shape: (batch_dim, action_dim). Default eval uses
-    # num_envs=10 so batch_dim=10.
-    device = agent.device
-    batch_dim = agent.batch_dim
-    agent.action.u = torch.zeros((batch_dim, 2), device=device)
-
-
-def _patched_action_script_creator(self):
-    def action_script(agent, world):
-        _stationary_action_script(agent, world, self)
-    return action_script
-
-
-def _patched_load(name):
-    module = _original_load(name)
-    if name == "flocking.py" or name == "flocking":
-        module.Scenario.action_script_creator = _patched_action_script_creator
-    return module
-
-
-_vmas_scenarios_pkg.load = _patched_load
-# --------------------------------------------------------------------------
-# End monkey-patch.
-# --------------------------------------------------------------------------
+# Monkey-patch: apply the shared VMAS flocking patches (stationary +
+# centered target + nearest-neighbor observation). MUST match the
+# training script's observation layout exactly so the trained ABCD
+# vector is valid at eval time. Configuration happens after argparse.
+from flocking_patch import configure as _flocking_patch_configure  # noqa: F401
 
 from benchmarl.algorithms.cmaes_han import CmaesHanConfig
 from benchmarl.algorithms.cmaes_han_optimizer import CmaesHanOptimizer
@@ -107,7 +70,10 @@ def parse_args():
     p.add_argument("--orbit-radius-tolerance", type=float, default=0.3)
     p.add_argument("--dt-floor", type=float, default=0.1)
 
-    p.add_argument("--hidden-size", type=int, default=18)
+    p.add_argument("--hidden-size", type=int, default=10,
+                   help="HAN hidden layer size. Default 10 matches "
+                        "the 10-dim flocking observation "
+                        "(pos+vel+target_rel+nn_rel_pos+nn_rel_vel).")
     p.add_argument("--lr-hebb", type=float, default=0.01)
     p.add_argument("--weight-init", type=float, default=1.0)
     p.add_argument("--window-size", type=int, default=10)
@@ -115,7 +81,7 @@ def parse_args():
     p.add_argument("--f-hebb", type=int, default=1)
 
     # Disturbance
-    p.add_argument("--disturbance-step", type=int, default=400,
+    p.add_argument("--disturbance-step", type=int, default=800,
                    help="Step at which to freeze the target agent.")
     p.add_argument("--frozen-agent-idx", type=int, default=2,
                    help="Index of the agent to freeze at the disturbance step.")
@@ -140,6 +106,13 @@ def parse_args():
 
 
 args = parse_args()
+
+# Configure the shared flocking patches to match training exactly
+_flocking_patch_configure(
+    target_pos_x=args.target_pos_x,
+    target_pos_y=args.target_pos_y,
+    neighbor_radius=args.neighbor_radius,
+)
 
 
 def _get_task():
@@ -366,13 +339,20 @@ def run_disturbance_episode(optimizer, env, group, max_steps, policy,
 
     action_key = (group, "action")
 
+    # Anchor position for the frozen agent — captured the first time the
+    # disturbance activates, then restored after every subsequent step
+    # so the frozen agent behaves like a fixed obstacle (other agents
+    # must learn to flow around it).
+    frozen_anchor_pos = None  # (2,) on env 0
+    frozen_agent_obj = None   # reference to the frozen VMAS Agent
+
     while not done and step < max_steps:
         # 1) Policy produces action for ALL agents.
         td = policy(td)
 
         # 2) DISTURBANCE: from the configured step onward, override the
-        #    frozen agent's action to zero so it cannot move under its
-        #    own power. (Other agents can still push it via physics.)
+        #    frozen agent's action to zero AND pin its position so it
+        #    behaves like a static obstacle (other agents can't push it).
         # NOTE on indexing: td[action_key] has shape (num_envs, n_agents,
         # action_dim). We collect data from env index 0 only, so the
         # override targets env 0 / agent `frozen_idx`. Slicing [:, idx]
@@ -380,6 +360,21 @@ def run_disturbance_episode(optimizer, env, group, max_steps, policy,
         # the same per-env behavior we expect).
         if step >= disturbance_step:
             td[action_key][:, frozen_idx] = 0.0
+            # First disturbance step: capture the agent's current
+            # position as the anchor (so we can restore it after each
+            # step). On subsequent steps we use the same anchor.
+            if frozen_agent_obj is None:
+                core = optimizer._vmas_core
+                policy_agents_now = (core.world.policy_agents
+                                     if core is not None
+                                     and hasattr(core, "world")
+                                     else None)
+                if (policy_agents_now is not None
+                        and frozen_idx < len(policy_agents_now)):
+                    frozen_agent_obj = policy_agents_now[frozen_idx]
+                    frozen_anchor_pos = (
+                        frozen_agent_obj.state.pos[0].detach().clone()
+                    )
 
         if render:
             try:
@@ -394,6 +389,20 @@ def run_disturbance_episode(optimizer, env, group, max_steps, policy,
 
         # 3) Step the env with the (possibly overridden) action.
         td = env.step(td)
+
+        # 3b) If the disturbance is active, force the frozen agent back
+        # to its anchor position so it behaves like a static obstacle.
+        # Without this, the other agents' collision impulses (collision
+        # force = 400) slowly drift it away, defeating the "static
+        # obstacle" semantics.
+        if frozen_agent_obj is not None and frozen_anchor_pos is not None:
+            with torch.no_grad():
+                frozen_agent_obj.state.pos[0] = frozen_anchor_pos
+                frozen_agent_obj.state.vel[0] = 0.0
+                # Also zero the accumulated force so VMAS doesn't try to
+                # apply residual impulses at the next substep.
+                if hasattr(frozen_agent_obj.state, "force"):
+                    frozen_agent_obj.state.force[0] = 0.0
 
         # 4) Read the vmas core for absolute positions, velocities,
         #    target. Patch state.rot from velocity direction (needed
