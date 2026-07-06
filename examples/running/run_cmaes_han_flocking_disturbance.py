@@ -1,18 +1,25 @@
 """Dynamic-adaptation evaluation for trained HAN on flocking.
 
 Loads a trained CMA-ES+HAN model and runs a single episode with a
-mid-episode disturbance: at step ``--disturbance-step`` the action of
-agent ``--frozen-agent-idx`` is overridden to zero (it "freezes" in
-place, but remains in the physics simulation and can be pushed around by
-the other agents). The remaining 3 agents continue to run the HAN
-policy.
+mid-episode disturbance. Two modes are supported:
+
+- ``--disturbance-mode freeze`` (default): at step ``--disturbance-step``
+  the action of agent ``--frozen-agent-idx`` is overridden to zero AND
+  its position/velocity/force are pinned to the value at the first
+  frozen step. It behaves as a static obstacle; the other agents must
+  learn to flow around it.
+- ``--disturbance-mode push``: at step ``--disturbance-step`` a one-shot
+  velocity impulse is applied to ``--frozen-agent-idx`` (default
+  direction = radial-out from the target, magnitude =
+  ``--push-magnitude``). No action zeroing, no per-step anchoring.
+  The agent must recover on its own.
 
 Goal: observe whether the trained HAN policy can maintain flocking
-behavior across a sudden reduction in the active agent count, which
-probes the policy's distributed/robustness properties (vs. an
-overfit-to-N-agents policy that collapses).
+behavior across either kind of disturbance, which probes the policy's
+distributed/robustness properties (vs. an overfit-to-N-agents policy
+that collapses).
 
-Outputs (under ``<experiment-path>/disturbance_eval/``):
+Outputs (under ``<experiment-path>/disturbance_eval_<mode>/``):
   - fitness_curve.png : 2-panel plot (fitness components + geometry)
   - trajectory.mp4    : rollout video with disturbance marker
   - per_step_data.npz : raw per-step arrays (for further analysis)
@@ -22,10 +29,19 @@ Usage:
         examples/running/run_cmaes_han_flocking_disturbance.py \\
         --experiment-path outputs/<your flocking experiment> \\
         --fitness-mode flocking_orbit \\
-        --disturbance-step 400 --frozen-agent-idx 2 \\
+        --disturbance-mode freeze --disturbance-step 400 \\
+        --frozen-agent-idx 2 \\
         --hidden-size 10 --window-size 10 --f-nn 4 --f-hebb 1 \\
         --orbit-radius 0.7 --orbit-radius-tolerance 0.3 --dt-floor 0.1 \\
         --neighbor-radius 0.5 --safety-distance 0.15
+
+    # Push mode:
+    /home/zhaozeming/miniconda3/envs/benchmarl/bin/python \\
+        examples/running/run_cmaes_han_flocking_disturbance.py \\
+        --experiment-path outputs/<your flocking experiment> \\
+        --disturbance-mode push --disturbance-step 400 \\
+        --push-magnitude 0.5 --push-direction radial-out \\
+        ...
 """
 
 import argparse
@@ -82,12 +98,25 @@ def parse_args():
 
     # Disturbance
     p.add_argument("--disturbance-step", type=int, default=800,
-                   help="Step at which to freeze the target agent.")
+                   help="Step at which to apply the disturbance.")
+    p.add_argument("--disturbance-mode", type=str, default="freeze",
+                   choices=["freeze", "push"],
+                   help="Disturbance variant: 'freeze' = zero action + "
+                        "anchor pos/vel; 'push' = one-shot velocity "
+                        "impulse (no anchoring).")
     p.add_argument("--frozen-agent-idx", type=int, default=2,
-                   help="Index of the agent to freeze at the disturbance step.")
+                   help="Index of the agent to disturb (freeze or push) at "
+                        "the disturbance step.")
+    p.add_argument("--push-magnitude", type=float, default=0.5,
+                   help="Push impulse magnitude (push mode only).")
+    p.add_argument("--push-direction", type=str, default="radial-out",
+                   choices=["radial-out", "fixed-x"],
+                   help="Push impulse direction: 'radial-out' uses "
+                        "normalize(agent.pos - target.pos); 'fixed-x' "
+                        "uses (1, 0).")
     p.add_argument("--num-episodes", type=int, default=1,
                    help="Number of disturbance episodes to run.")
-    p.add_argument("--max-steps", type=int, default=800,
+    p.add_argument("--max-steps", type=int, default=1600,
                    help="Total episode length (must be > --disturbance-step).")
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--max-video-frames", type=int, default=800)
@@ -279,7 +308,7 @@ def _compute_per_step_metrics(optimizer, pos_history, rot_history,
         in_collision = (dist_for_collision < sd).any(dim=-1)
         S = 1.0 - in_collision.float().mean().item()
 
-        Fg = At + Dt + 0.5 * Cg + 0.5 * S
+        Fg = 1.5 * At + Dt + 0.2 * Cg + 1.0 * S
 
         Fg_arr[t] = Fg
         At_arr[t] = At
@@ -301,8 +330,20 @@ def _compute_per_step_metrics(optimizer, pos_history, rot_history,
 
 
 def run_disturbance_episode(optimizer, env, group, max_steps, policy,
-                            disturbance_step, frozen_idx, render=False):
-    """Run a single episode with a freeze disturbance.
+                            disturbance_step, frozen_idx, render=False,
+                            disturbance_mode="freeze",
+                            push_magnitude=0.5,
+                            push_direction="radial-out"):
+    """Run a single episode with a disturbance.
+
+    ``disturbance_mode``:
+      - ``freeze`` (default): from ``disturbance_step`` onward, the
+        action of agent ``frozen_idx`` is overridden to zero AND its
+        position/velocity/force are pinned to the value at the first
+        frozen step (static obstacle semantics).
+      - ``push``: at ``disturbance_step``, a one-shot velocity impulse
+        is applied to agent ``frozen_idx`` (no action override, no
+        per-step anchoring). The agent must recover on its own.
 
     Returns per-step data: pos_history, rot_history, vel_history,
     target_pos_history, frames (optional, for video).
@@ -342,28 +383,42 @@ def run_disturbance_episode(optimizer, env, group, max_steps, policy,
     # Anchor position for the frozen agent — captured the first time the
     # disturbance activates, then restored after every subsequent step
     # so the frozen agent behaves like a fixed obstacle (other agents
-    # must learn to flow around it).
+    # must learn to flow around it). Only used in freeze mode.
     frozen_anchor_pos = None  # (2,) on env 0
     frozen_agent_obj = None   # reference to the frozen VMAS Agent
+    # Push mode fires the impulse exactly once at disturbance_step.
+    push_applied = False
 
     while not done and step < max_steps:
         # 1) Policy produces action for ALL agents.
         td = policy(td)
 
-        # 2) DISTURBANCE: from the configured step onward, override the
-        #    frozen agent's action to zero AND pin its position so it
-        #    behaves like a static obstacle (other agents can't push it).
-        # NOTE on indexing: td[action_key] has shape (num_envs, n_agents,
-        # action_dim). We collect data from env index 0 only, so the
-        # override targets env 0 / agent `frozen_idx`. Slicing [:, idx]
-        # would freeze that agent in ALL envs (so pos_history etc. show
-        # the same per-env behavior we expect).
+        # 2) DISTURBANCE branch.
         if step >= disturbance_step:
-            td[action_key][:, frozen_idx] = 0.0
-            # First disturbance step: capture the agent's current
-            # position as the anchor (so we can restore it after each
-            # step). On subsequent steps we use the same anchor.
-            if frozen_agent_obj is None:
+            if disturbance_mode == "freeze":
+                # Override the frozen agent's action to zero AND pin its
+                # position so it behaves like a static obstacle (other
+                # agents can't push it).
+                # NOTE on indexing: td[action_key] has shape
+                # (num_envs, n_agents, action_dim). Slicing [:, idx]
+                # freezes that agent in ALL envs.
+                td[action_key][:, frozen_idx] = 0.0
+                if frozen_agent_obj is None:
+                    core = optimizer._vmas_core
+                    policy_agents_now = (core.world.policy_agents
+                                         if core is not None
+                                         and hasattr(core, "world")
+                                         else None)
+                    if (policy_agents_now is not None
+                            and frozen_idx < len(policy_agents_now)):
+                        frozen_agent_obj = policy_agents_now[frozen_idx]
+                        frozen_anchor_pos = (
+                            frozen_agent_obj.state.pos[0].detach().clone()
+                        )
+            elif disturbance_mode == "push" and not push_applied:
+                # One-shot velocity impulse. No action override, no
+                # anchoring — the agent can keep responding to the
+                # policy from the next step onward.
                 core = optimizer._vmas_core
                 policy_agents_now = (core.world.policy_agents
                                      if core is not None
@@ -372,9 +427,30 @@ def run_disturbance_episode(optimizer, env, group, max_steps, policy,
                 if (policy_agents_now is not None
                         and frozen_idx < len(policy_agents_now)):
                     frozen_agent_obj = policy_agents_now[frozen_idx]
-                    frozen_anchor_pos = (
-                        frozen_agent_obj.state.pos[0].detach().clone()
-                    )
+                    tgt_pos = target.state.pos[0] if target is not None \
+                        else torch.zeros_like(
+                            frozen_agent_obj.state.pos[0])
+                    if push_direction == "radial-out":
+                        delta = (frozen_agent_obj.state.pos[0]
+                                 - tgt_pos).detach()
+                        norm = torch.linalg.vector_norm(delta)
+                        if norm.item() > 1e-6:
+                            direction = delta / norm
+                        else:
+                            direction = torch.tensor(
+                                [1.0, 0.0],
+                                device=delta.device, dtype=delta.dtype)
+                    else:  # fixed-x
+                        direction = torch.tensor(
+                            [1.0, 0.0],
+                            device=frozen_agent_obj.state.vel[0].device,
+                            dtype=frozen_agent_obj.state.vel[0].dtype)
+                    with torch.no_grad():
+                        frozen_agent_obj.state.vel[0] = (
+                            frozen_agent_obj.state.vel[0]
+                            + push_magnitude * direction
+                        )
+                push_applied = True
 
         if render:
             try:
@@ -390,12 +466,14 @@ def run_disturbance_episode(optimizer, env, group, max_steps, policy,
         # 3) Step the env with the (possibly overridden) action.
         td = env.step(td)
 
-        # 3b) If the disturbance is active, force the frozen agent back
-        # to its anchor position so it behaves like a static obstacle.
-        # Without this, the other agents' collision impulses (collision
-        # force = 400) slowly drift it away, defeating the "static
-        # obstacle" semantics.
-        if frozen_agent_obj is not None and frozen_anchor_pos is not None:
+        # 3b) Freeze-mode only: force the frozen agent back to its
+        # anchor position so it behaves like a static obstacle. Without
+        # this, the other agents' collision impulses (collision force =
+        # 400) slowly drift it away, defeating the "static obstacle"
+        # semantics. Push mode skips this entirely.
+        if (disturbance_mode == "freeze"
+                and frozen_agent_obj is not None
+                and frozen_anchor_pos is not None):
             with torch.no_grad():
                 frozen_agent_obj.state.pos[0] = frozen_anchor_pos
                 frozen_agent_obj.state.vel[0] = 0.0
@@ -609,16 +687,21 @@ if __name__ == "__main__":
         raise ValueError("--frozen-agent-idx must be >= 0")
 
     exp_path = Path(args.experiment_path)
-    output_dir = exp_path / "disturbance_eval"
+    output_dir = exp_path / f"disturbance_eval_{args.disturbance_mode}"
     output_dir.mkdir(exist_ok=True)
 
     print("=" * 70)
-    print("Dynamic-Adaptation Eval — Flocking with Frozen Agent")
+    print(f"Dynamic-Adaptation Eval — Flocking with "
+          f"{args.disturbance_mode.capitalize()} Agent")
     print("=" * 70)
     print(f"  experiment: {exp_path}")
     print(f"  fitness_mode: {args.fitness_mode}")
+    print(f"  disturbance_mode: {args.disturbance_mode}")
     print(f"  disturbance_step: {args.disturbance_step}")
     print(f"  frozen_agent_idx: {args.frozen_agent_idx}")
+    if args.disturbance_mode == "push":
+        print(f"  push_magnitude: {args.push_magnitude}")
+        print(f"  push_direction: {args.push_direction}")
     print(f"  max_steps: {args.max_steps}")
     print(f"  num_episodes: {args.num_episodes}")
     print(f"  output_dir: {output_dir}")
@@ -629,7 +712,7 @@ if __name__ == "__main__":
     critic_model_config = _create_critic_model_config()
 
     # Build the experiment (test_env, policy, etc.) under outputs/ — but we
-    # will save disturbance outputs under <exp>/disturbance_eval/.
+    # will save disturbance outputs under <exp>/disturbance_eval_<mode>/.
     base_output = Path(__file__).parent.parent / "outputs"
     base_output.mkdir(exist_ok=True)
     experiment = _setup_experiment_for_cmaes(
@@ -652,6 +735,9 @@ if __name__ == "__main__":
                 disturbance_step=args.disturbance_step,
                 frozen_idx=args.frozen_agent_idx,
                 render=True,
+                disturbance_mode=args.disturbance_mode,
+                push_magnitude=args.push_magnitude,
+                push_direction=args.push_direction,
             )
 
         print(f"  ran {data['steps']} steps, "

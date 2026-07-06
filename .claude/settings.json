@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "/home/zhaozeming/miniconda3/envs/benchmarl/lib/python3.10/site-packages/vmas/scenarios"
+    ]
+  }
+}

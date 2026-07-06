@@ -1,13 +1,20 @@
-"""CMA-ES HAN training on flocking_light (light-intensity gradient field).
+"""CMA-ES HAN training on flocking_signal (dynamic target + light field).
 
-Leaders sense a scalar light field Φ(pos)=1/(||pos-target||+ε) at their
-own position and must navigate to the target purely from this scalar
-(no target_rel). Followers sense no light (slot is zero-padded); they
-follow their nearest in-range neighbor. Leaders and followers share a
-single network and a single set of ABCD parameters — there is no
-is_leader flag. Fitness is the time-averaged mean light intensity over
-all agents, so the swarm is rewarded for both reaching the target
-quickly and staying there.
+A scalar light-intensity field Φ(pos, t) = 1/(||pos-target(t)||+ε) is
+centered on a moving target. Leaders sense the field at their own
+position; followers do not (slot is zero-padded). Leaders and
+followers share a single network and a single set of ABCD parameters
+— there is no is_leader flag.
+
+The target moves at constant speed and randomly changes direction
+every ``--direction-change-interval`` steps. This makes the optimal
+heading non-stationary: leaders must keep updating their gradient
+estimate (via HAN weight updates) and followers must keep adapting to
+the leaders' turning.
+
+Fitness is the time-averaged mean light intensity over all agents, so
+the swarm is rewarded for both catching up to the target quickly and
+staying with it as it moves.
 """
 import argparse
 import json
@@ -26,11 +33,11 @@ from benchmarl.models.han import HanConfig
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="CMA-ES HAN on flocking_light (light-intensity gradient)"
+        description="CMA-ES HAN on flocking_signal (dynamic target + light)"
     )
 
     # Task parameters
-    parser.add_argument("--n-leaders", type=int, default=2)
+    parser.add_argument("--n-leaders", type=int, default=1)
     parser.add_argument("--n-followers", type=int, default=4)
     parser.add_argument(
         "--neighbor-radius", type=float, default=0.5,
@@ -42,25 +49,25 @@ def parse_args():
     parser.add_argument("--spawn-radius", type=float, default=0.9)
     parser.add_argument("--light-eps", type=float, default=0.01)
     parser.add_argument(
-        "--clustered-spawn", action="store_true",
-        help="Spawn all agents clustered in a disc instead of the "
-             "annulus around target.",
+        "--target-speed", type=float, default=0.01,
+        help="Target speed in world units per env step.",
     )
-    parser.add_argument("--spawn-cluster-center-x", type=float, default=0.5)
-    parser.add_argument("--spawn-cluster-center-y", type=float, default=0.0)
-    parser.add_argument("--spawn-cluster-radius", type=float, default=0.15)
+    parser.add_argument(
+        "--direction-change-interval", type=int, default=50,
+        help="Number of env steps between target direction changes.",
+    )
     parser.add_argument("--max-steps", type=int, default=400)
 
     # Fitness mode
     parser.add_argument(
-        "--fitness-mode", type=str, default="flocking_light_intensity",
+        "--fitness-mode", type=str, default="flocking_signal_intensity",
         choices=CmaesHanOptimizer.FITNESS_MODES,
-        help="Fitness function mode. The default 'flocking_light_intensity' "
+        help="Fitness function mode. The default 'flocking_signal_intensity' "
              "is the time-averaged mean light intensity over all agents.",
     )
 
     # CMA-ES parameters
-    parser.add_argument("--cmaes-gens", type=int, default=50)
+    parser.add_argument("--cmaes-gens", type=int, default=30)
     parser.add_argument("--pop-size", type=int, default=30)
     parser.add_argument("--sigma0", type=float, default=0.3)
     parser.add_argument("--n-eval-episodes", type=int, default=2)
@@ -73,8 +80,7 @@ def parse_args():
     parser.add_argument("--f-nn", type=int, default=4)
     parser.add_argument("--f-hebb", type=int, default=1)
 
-    # Other CmaesHanOptimizer kwargs (API compatibility; not used by the
-    # default 'flocking_light_intensity' fitness).
+    # Other CmaesHanOptimizer kwargs (API compatibility; not used here).
     parser.add_argument("--collision-penalty-weight", type=float, default=2.0)
     parser.add_argument("--safety-distance", type=float, default=0.15)
     parser.add_argument("--movement-target-displacement", type=float, default=1.0)
@@ -96,7 +102,7 @@ args = parse_args()
 
 
 def _get_task():
-    task = VmasTask.FLOCKING_LIGHT.get_from_yaml()
+    task = VmasTask.FLOCKING_SIGNAL.get_from_yaml()
     task.config["n_leaders"] = args.n_leaders
     task.config["n_followers"] = args.n_followers
     task.config["neighbor_radius"] = args.neighbor_radius
@@ -105,10 +111,8 @@ def _get_task():
     task.config["min_spawn_dist"] = args.min_spawn_dist
     task.config["spawn_radius"] = args.spawn_radius
     task.config["light_eps"] = args.light_eps
-    task.config["clustered_spawn"] = args.clustered_spawn
-    task.config["spawn_cluster_center_x"] = args.spawn_cluster_center_x
-    task.config["spawn_cluster_center_y"] = args.spawn_cluster_center_y
-    task.config["spawn_cluster_radius"] = args.spawn_cluster_radius
+    task.config["target_speed"] = args.target_speed
+    task.config["direction_change_interval"] = args.direction_change_interval
     task.config["max_steps"] = args.max_steps
     return task
 
@@ -158,20 +162,17 @@ if __name__ == "__main__":
     critic_model_config = _create_critic_model_config()
 
     print("=" * 60)
-    print("CMA-ES HAN — Flocking LIGHT (light-intensity gradient)")
+    print("CMA-ES HAN — Flocking SIGNAL (dynamic target + light)")
     print("=" * 60)
-    print(f"Task: flocking_light | n_leaders={args.n_leaders}, "
+    print(f"Task: flocking_signal | n_leaders={args.n_leaders}, "
           f"n_followers={args.n_followers}")
     print(f"  neighbor_radius={args.neighbor_radius}, "
-          f"target=({args.target_pos_x}, {args.target_pos_y}), "
+          f"target_init=({args.target_pos_x}, {args.target_pos_y})")
+    print(f"  target_speed={args.target_speed}, "
+          f"direction_change_interval={args.direction_change_interval}, "
           f"light_eps={args.light_eps}")
-    if args.clustered_spawn:
-        print(f"  spawn: CLUSTERED at ({args.spawn_cluster_center_x}, "
-              f"{args.spawn_cluster_center_y}), "
-              f"radius={args.spawn_cluster_radius}, max_steps={args.max_steps}")
-    else:
-        print(f"  spawn: annulus [{args.min_spawn_dist}, {args.spawn_radius}] "
-              f"around target, max_steps={args.max_steps}")
+    print(f"  spawn: annulus [{args.min_spawn_dist}, {args.spawn_radius}], "
+          f"max_steps={args.max_steps}")
     print(f"Fitness mode: {args.fitness_mode}")
     print(f"HAN: hidden={args.hidden_size}, window={args.window_size}, "
           f"f_nn={args.f_nn}, f_hebb={args.f_hebb}")

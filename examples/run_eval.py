@@ -113,10 +113,19 @@ def main():
     ap.add_argument("--scenarios", type=str, nargs="+",
                     default=["orbit", "frozen_agent"],
                     choices=["orbit", "frozen_agent"])
+    ap.add_argument("--disturbance-modes", type=str, nargs="+",
+                    default=["freeze", "push"],
+                    choices=["freeze", "push"],
+                    help="For frozen_agent scenario: which disturbance "
+                         "modes to evaluate. Default: both.")
     ap.add_argument("--max-steps", type=int, default=800,
                     help="Episode horizon (must match training).")
     ap.add_argument("--disturbance-step", type=int, default=400,
                     help="For frozen_agent scenario only.")
+    ap.add_argument("--push-magnitude", type=float, default=0.5,
+                    help="Push impulse magnitude (push mode only).")
+    ap.add_argument("--push-direction", type=str, default="radial-out",
+                    choices=["radial-out", "fixed-x"])
     ap.add_argument("--num-episodes", type=int, default=3,
                     help="Number of eval episodes per (algo, scenario, n)")
     ap.add_argument("--han-hidden-size", type=int, default=10,
@@ -168,6 +177,9 @@ def main():
     print(f"  max_steps : {args.max_steps}")
     if "frozen_agent" in args.scenarios:
         print(f"  disturbance_step: {args.disturbance_step}")
+        print(f"  disturbance_modes: {args.disturbance_modes}")
+        print(f"  push_magnitude:   {args.push_magnitude}")
+        print(f"  push_direction:   {args.push_direction}")
     print(f"  num_episodes per run: {args.num_episodes}")
     print()
 
@@ -177,8 +189,9 @@ def main():
     log_dir = Path(args.log_dir) if args.log_dir else None
     failures = []
 
-    def _eval(algo: str, scenario: str, n: int) -> None:
-        log_path = (log_dir / f"{algo}_{scenario}_n{n}.log"
+    def _eval(algo: str, scenario: str, n: int,
+              mode: str = "freeze") -> None:
+        log_path = (log_dir / f"{algo}_{scenario}_{mode}_n{n}.log"
                     if log_dir else None)
         cmd = [
             sys.executable, "run_comparison_eval.py",
@@ -196,25 +209,33 @@ def main():
             cmd += ["--static-mlp-exp-path", str(slm_path)]
 
         if scenario == "frozen_agent":
-            cmd += ["--disturbance-step", str(args.disturbance_step)]
+            cmd += ["--disturbance-step", str(args.disturbance_step),
+                    "--disturbance-mode", mode,
+                    "--push-magnitude", str(args.push_magnitude),
+                    "--push-direction", args.push_direction]
 
-        print(f"\n[{algo}/{scenario}/n={n}] launching...")
+        print(f"\n[{algo}/{scenario}/{mode}/n={n}] launching...")
         rc = _run(cmd, log_path=log_path)
         if rc != 0:
-            failures.append((algo, scenario, n, rc))
+            failures.append((algo, scenario, mode, n, rc))
             print(f"  FAILED rc={rc} (log: {log_path})")
         else:
             print(f"  OK")
 
     for n in args.n_agents:
         for scenario in args.scenarios:
-            for algo in ("han", "cmaes-static-mlp"):
-                _eval(algo, scenario, n)
+            if scenario == "frozen_agent":
+                for mode in args.disturbance_modes:
+                    for algo in ("han", "cmaes-static-mlp"):
+                        _eval(algo, scenario, n, mode=mode)
+            else:
+                for algo in ("han", "cmaes-static-mlp"):
+                    _eval(algo, scenario, n, mode="freeze")
 
     if failures:
         print("\n!!! Some evaluations failed:")
-        for algo, scenario, n, rc in failures:
-            print(f"   {algo} / {scenario} / n={n}  rc={rc}")
+        for algo, scenario, mode, n, rc in failures:
+            print(f"   {algo} / {scenario} / {mode} / n={n}  rc={rc}")
         if not args.skip_plot:
             print("Plotting anyway with whatever data is on disk.")
     else:
@@ -239,6 +260,11 @@ def main():
         "--static-mlp-path", str(slm_path),
         "--n-agents", *map(str, args.n_agents),
         "--scenario", "both" if len(args.scenarios) > 1 else args.scenarios[0],
+        "--mode", ("both"
+                   if (len(args.disturbance_modes) > 1
+                       and "frozen_agent" in args.scenarios)
+                   else (args.disturbance_modes[0]
+                         if args.disturbance_modes else "freeze")),
         "--out", str(out_dir),
     ]
     print(f"\n[plot] launching: {' '.join(cmd)}")

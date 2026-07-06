@@ -29,6 +29,7 @@ class CmaesHanOptimizer:
         "flocking_orbit",
         "flocking_lf_arrival",
         "flocking_light_intensity",
+        "flocking_signal_intensity",
     ]
 
     def __init__(
@@ -210,6 +211,15 @@ class CmaesHanOptimizer:
             return self._compute_flocking_light_intensity_fitness(
                 pos_history, target_pos_history
             )
+        elif self.fitness_mode == "flocking_signal_intensity":
+            if pos_history is None or target_pos_history is None:
+                raise ValueError(
+                    "flocking_signal_intensity mode requires pos_history "
+                    "and target_pos_history"
+                )
+            return self._compute_flocking_signal_intensity_fitness(
+                pos_history, target_pos_history
+            )
         else:
             raise ValueError(f"Unknown fitness mode: {self.fitness_mode}")
 
@@ -360,7 +370,7 @@ class CmaesHanOptimizer:
         # orbit terms so they don't dominate the fitness.
         # Adjusted weights (方案 E): stronger At separation, weaker cohesion.
         w_C = 0.2
-        w_S = 0.8
+        w_S = 1.0
         r_star = float(self.orbit_radius)
         r_sigma = float(self.orbit_radius_tolerance)
         dt_floor = float(self.dt_floor)
@@ -500,6 +510,44 @@ class CmaesHanOptimizer:
                 pos - target.unsqueeze(0), dim=-1
             )                                       # (N,)
             intensity = 1.0 / (dist + eps)          # (N,)
+            intensity_sum += intensity.mean().item()
+        return intensity_sum / T
+
+    def _compute_flocking_signal_intensity_fitness(
+        self, pos_history, target_pos_history
+    ) -> float:
+        """Time-averaged light-intensity fitness for ``flocking_signal``.
+
+        Identical to ``_compute_flocking_light_intensity_fitness`` in
+        formula, but ``flocking_signal`` has a moving target so the
+        light field Φ is recomputed per step using the current target
+        position.
+
+        Fitness = mean_over_time( mean_over_agents( Φ(pos_t, t) ) )
+
+        Args:
+            pos_history: list of length T with (N, 2) CPU tensors.
+            target_pos_history: list of length T with (2,) CPU tensors
+                (target absolute position per step — varies because the
+                target moves).
+        """
+        T = len(pos_history)
+        if T == 0:
+            return 0.0
+        eps = 0.01
+        core = self._get_vmas_core()
+        scenario = getattr(core, "scenario", None)
+        if scenario is not None:
+            eps = float(getattr(scenario, "light_eps", eps))
+
+        intensity_sum = 0.0
+        for t in range(T):
+            pos = pos_history[t]
+            target = target_pos_history[t]
+            dist = torch.linalg.vector_norm(
+                pos - target.unsqueeze(0), dim=-1
+            )
+            intensity = 1.0 / (dist + eps)
             intensity_sum += intensity.mean().item()
         return intensity_sum / T
 

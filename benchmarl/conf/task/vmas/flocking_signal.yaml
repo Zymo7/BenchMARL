@@ -1,0 +1,18 @@
+defaults:
+  - vmas_flocking_signal_config
+  - _self_
+
+
+max_steps: 800
+n_leaders: 4
+n_followers: 4
+neighbor_radius: 0.5
+target_pos_x: 0.0
+target_pos_y: 0.0
+min_spawn_dist: 0.3
+spawn_radius: 0.9
+light_eps: 0.01
+target_speed: 0.01
+direction_change_interval: 50
+x_dim: 1.0
+y_dim: 1.0

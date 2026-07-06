@@ -87,6 +87,32 @@ def parse_args() -> argparse.Namespace:
                    help="For --scenario frozen_agent only.")
     p.add_argument("--frozen-agent-idx", type=int, default=0,
                    help="For --scenario frozen_agent only.")
+    p.add_argument("--disturbance-mode", type=str, default="freeze",
+                   choices=["freeze", "push"],
+                   help="Disturbance variant for frozen_agent scenario. "
+                        "'freeze' = zero action + anchor pos/vel. "
+                        "'push'   = one-shot velocity impulse (radial-out "
+                        "by default) without action zeroing.")
+    p.add_argument("--push-magnitude", type=float, default=0.5,
+                   help="Push impulse magnitude (push mode only).")
+    p.add_argument("--push-direction", type=str, default="radial-out",
+                   choices=["radial-out", "fixed-x"],
+                   help="Direction of the push impulse: 'radial-out' uses "
+                        "normalize(agent.pos - target.pos); 'fixed-x' "
+                        "uses (1, 0).")
+    p.add_argument("--stable-window", type=int, default=20,
+                   help="Number of consecutive steps the swarm must "
+                        "satisfy the stability criteria for the episode "
+                        "to count as stable.")
+    p.add_argument("--r-tol-frac", type=float, default=0.2,
+                   help="Mean-radius tolerance as a fraction of r★. "
+                        "Stable iff mean_r ∈ [r★(1-frac), r★(1+frac)].")
+    p.add_argument("--theta-tol-frac", type=float, default=0.5,
+                   help="Angular-spread tolerance as a fraction of "
+                        "2π/N. Stable iff std(θ) < frac·2π/N.")
+    p.add_argument("--min-tangential-speed", type=float, default=0.05,
+                   help="Stable iff mean |tangential velocity| exceeds "
+                        "this value.")
 
     # Fitness / scenario parameters (must match training time).
     p.add_argument("--neighbor-radius", type=float, default=0.5)
@@ -301,14 +327,22 @@ def _run_episode(
     save_video: bool,
     max_video_frames: int,
     fps: int,
+    disturbance_mode: str = "freeze",
+    push_magnitude: float = 0.5,
+    push_direction: str = "radial-out",
 ):
     """Run a single episode under the requested scenario.
 
-    The policy is invoked for ALL agents every step. In the
-    ``frozen_agent`` scenario, the action for the frozen agent is
-    overridden to 0 from ``disturbance_step`` onward, and its position
-    is anchored to the value it had at the first frozen step (so it
-    behaves as a static obstacle, mirroring the HAN disturbance script).
+    The policy is invoked for ALL agents every step. Two disturbance
+    modes are supported under ``frozen_agent``:
+
+    - ``freeze`` (default): the action for the frozen agent is
+      overridden to 0 from ``disturbance_step`` onward, and its
+      position/velocity/force are anchored each step (static obstacle).
+    - ``push``: at ``disturbance_step`` a one-shot velocity impulse is
+      applied to the disturbed agent (default direction = radial-out,
+      magnitude = ``push_magnitude``). No action zeroing, no per-step
+      anchoring. The agent must recover on its own.
     """
     td = env.reset()
 
@@ -332,13 +366,29 @@ def _run_episode(
 
     frozen_anchor_pos = None
     frozen_agent_obj = None
+    push_applied = False   # for push mode: only fire the impulse once
 
     while not done and step < max_steps:
         td = policy(td)
 
         if scenario == "frozen_agent" and step >= disturbance_step:
-            td[action_key][:, frozen_idx] = 0.0
-            if frozen_agent_obj is None:
+            if disturbance_mode == "freeze":
+                td[action_key][:, frozen_idx] = 0.0
+                if frozen_agent_obj is None:
+                    core = optimizer._vmas_core
+                    policy_agents_now = (
+                        core.world.policy_agents
+                        if core is not None and hasattr(core, "world")
+                        else None
+                    )
+                    if (policy_agents_now is not None
+                            and frozen_idx < len(policy_agents_now)):
+                        frozen_agent_obj = policy_agents_now[frozen_idx]
+                        frozen_anchor_pos = (
+                            frozen_agent_obj.state.pos[0].detach().clone()
+                        )
+            elif disturbance_mode == "push" and not push_applied:
+                # Apply a one-shot velocity impulse to the disturbed agent.
                 core = optimizer._vmas_core
                 policy_agents_now = (
                     core.world.policy_agents
@@ -348,9 +398,30 @@ def _run_episode(
                 if (policy_agents_now is not None
                         and frozen_idx < len(policy_agents_now)):
                     frozen_agent_obj = policy_agents_now[frozen_idx]
-                    frozen_anchor_pos = (
-                        frozen_agent_obj.state.pos[0].detach().clone()
-                    )
+                    tgt_pos = target.state.pos[0] if target is not None \
+                        else torch.zeros_like(
+                            frozen_agent_obj.state.pos[0])
+                    if push_direction == "radial-out":
+                        delta = (frozen_agent_obj.state.pos[0]
+                                 - tgt_pos).detach()
+                        n = torch.linalg.vector_norm(delta)
+                        if n.item() > 1e-6:
+                            direction = delta / n
+                        else:
+                            direction = torch.tensor(
+                                [1.0, 0.0],
+                                device=delta.device, dtype=delta.dtype)
+                    else:  # fixed-x
+                        direction = torch.tensor(
+                            [1.0, 0.0],
+                            device=frozen_agent_obj.state.vel[0].device,
+                            dtype=frozen_agent_obj.state.vel[0].dtype)
+                    with torch.no_grad():
+                        frozen_agent_obj.state.vel[0] = (
+                            frozen_agent_obj.state.vel[0]
+                            + push_magnitude * direction
+                        )
+                push_applied = True
 
         if save_video and len(frames) < max_video_frames:
             try:
@@ -365,7 +436,11 @@ def _run_episode(
 
         td = env.step(td)
 
-        if frozen_agent_obj is not None and frozen_anchor_pos is not None:
+        # Freeze-mode only: anchor pos/vel/force each step.
+        if (scenario == "frozen_agent"
+                and disturbance_mode == "freeze"
+                and frozen_agent_obj is not None
+                and frozen_anchor_pos is not None):
             with torch.no_grad():
                 frozen_agent_obj.state.pos[0] = frozen_anchor_pos
                 frozen_agent_obj.state.vel[0] = 0.0
@@ -524,6 +599,261 @@ def _phase_summary(metrics: Dict, T: int, scenario: str,
             for name, (lo, hi) in phases.items()}
 
 
+# ============================================================================
+# Geometric quality metrics (T_stable, T_recover, stable_quality, ...)
+# ============================================================================
+def _max_gap_deviation(theta: torch.Tensor) -> torch.Tensor:
+    """Max |gap_i - 2π/N| over sorted-by-angle adjacent agents.
+
+    For N agents evenly distributed, this is 0. For clustered agents,
+    it can be up to ~2π. Robust to wrap-around.
+    """
+    th_sorted, _ = torch.sort(theta)
+    n = th_sorted.numel()
+    if n < 2:
+        return torch.tensor(0.0)
+    gaps = torch.empty(n)
+    gaps[:-1] = th_sorted[1:] - th_sorted[:-1]
+    # Last gap wraps from max angle back to min angle + 2π.
+    gaps[-1] = (th_sorted[0] + 2.0 * math.pi) - th_sorted[-1]
+    ideal = 2.0 * math.pi / n
+    return (gaps - ideal).abs().max()
+
+
+def _is_step_stable(
+    pos: torch.Tensor, vel: torch.Tensor, tgt: torch.Tensor,
+    exclude_mask: torch.Tensor, *, r_star: float, r_tol_frac: float,
+    theta_tol_frac: float, min_tangential_speed: float, N: int,
+) -> bool:
+    """Single-step stability predicate over (possibly masked) swarm.
+
+    Stability criteria (all must hold for the masked subset):
+      1. mean radius in [r★·(1-r_tol_frac), r★·(1+r_tol_frac)]
+      2. max gap deviation from even spacing < theta_tol_frac · 2π/N
+         (0 for perfectly evenly distributed, large for clumping)
+      3. ≥80% of agents share a tangential-velocity sign
+      4. mean |tangential velocity| > min_tangential_speed
+    """
+    r_vec = pos - tgt                              # (N, 2)
+    r = torch.linalg.vector_norm(r_vec, dim=-1)    # (N,)
+    keep = ~exclude_mask
+    r_k = r[keep]
+    if r_k.numel() < 2:
+        return False
+    m_r = r_k.mean().item()
+    r_lo = r_star * (1.0 - r_tol_frac)
+    r_hi = r_star * (1.0 + r_tol_frac)
+    if not (r_lo <= m_r <= r_hi):
+        return False
+    theta = torch.atan2(r_vec[:, 1], r_vec[:, 0])
+    max_gap_dev = _max_gap_deviation(theta[keep]).item()
+    theta_tol = theta_tol_frac * 2.0 * math.pi / max(N, 1)
+    if max_gap_dev >= theta_tol:
+        return False
+    r_hat = r_vec / (r.unsqueeze(-1) + 1e-9)
+    tangent = torch.stack([-r_hat[:, 1], r_hat[:, 0]], dim=-1)
+    tang_v = (vel * tangent).sum(dim=-1)          # (N,)
+    tv_k = tang_v[keep]
+    pos_share = (tv_k > 0).float().mean().item()
+    neg_share = (tv_k < 0).float().mean().item()
+    if max(pos_share, neg_share) < 0.8:
+        return False
+    return tv_k.abs().mean().item() > min_tangential_speed
+
+
+def _stable_quality_from_window(
+    pos_win: torch.Tensor, vel_win: torch.Tensor, tgt_win: torch.Tensor,
+    exclude_mask: torch.Tensor, *, r_star: float, r_tol_frac: float,
+    theta_tol_frac: float, N: int,
+) -> Dict[str, float]:
+    """Compute the geometric-quality dict for a (T_win, N, 2) window.
+
+    Returns a dict with mean_r, std_r, max_gap_dev, eccentricity,
+    tangential_v_mean, stable_quality (in [0, 1]; nan if window is empty).
+    """
+    keep = ~exclude_mask
+    if keep.sum().item() < 2 or pos_win.shape[0] == 0:
+        nan = float("nan")
+        return {
+            "mean_r": nan, "std_r": nan, "max_gap_dev": nan,
+            "eccentricity": nan, "tangential_v_mean": nan,
+            "stable_quality": nan,
+        }
+    # Per-agent quantities aggregated over time: (T, N, 2) -> (N,).
+    r_vec_w = pos_win - tgt_win.unsqueeze(1)
+    r_w = torch.linalg.vector_norm(r_vec_w, dim=-1)         # (T, N)
+    theta_w = torch.atan2(r_vec_w[:, :, 1], r_vec_w[:, :, 0])
+    r_hat_w = r_vec_w / (r_w.unsqueeze(-1) + 1e-9)
+    tangent_w = torch.stack(
+        [-r_hat_w[:, :, 1], r_hat_w[:, :, 0]], dim=-1
+    )                                                       # (T, N, 2)
+    tang_v_w = (vel_win * tangent_w).sum(dim=-1)            # (T, N)
+    r_mean_agent = r_w.mean(dim=0)                          # (N,)
+    r_std_agent = r_w.std(dim=0)
+    # For each kept agent, use the *time-mean* of theta (handle wrap by
+    # operating on cos/sin mean). For tangential velocity, just time-mean.
+    cos_t = torch.cos(theta_w).mean(dim=0)
+    sin_t = torch.sin(theta_w).mean(dim=0)
+    theta_mean_agent = torch.atan2(sin_t, cos_t)            # (N,)
+    tang_v_mean_agent = tang_v_w.mean(dim=0)                # (N,)
+
+    r_k = r_mean_agent[keep]
+    th_k = theta_mean_agent[keep]
+    tv_k = tang_v_mean_agent[keep]
+    mean_r = r_k.mean().item()
+    std_r = r_k.std().item()
+    max_gap_dev = _max_gap_deviation(th_k).item()
+    eccentricity = max(0.0, (r_k.max() - r_k.min()).item()
+                       / (2.0 * r_star))
+    tangential_v_mean = tv_k.mean().item()
+
+    radius_score = 1.0 - min(1.0, abs(mean_r - r_star)
+                             / (r_tol_frac * r_star))
+    theta_tol = theta_tol_frac * 2.0 * math.pi / max(N, 1)
+    theta_score = 1.0 - min(1.0, max_gap_dev / max(theta_tol, 1e-9))
+    direction_score = 1.0 if tangential_v_mean > 0 else 0.0
+    ring_score = 1.0 - min(1.0, eccentricity)
+    stable_quality = (
+        0.4 * radius_score
+        + 0.3 * theta_score
+        + 0.2 * direction_score
+        + 0.1 * ring_score
+    )
+    return {
+        "mean_r": float(mean_r),
+        "std_r": float(std_r),
+        "max_gap_dev": float(max_gap_dev),
+        "eccentricity": float(eccentricity),
+        "tangential_v_mean": float(tangential_v_mean),
+        "stable_quality": float(stable_quality),
+    }
+
+
+def _compute_geometric_quality(
+    pos_history, vel_history, target_pos_history,
+    *, frozen_mask=None, disturbance_step=None,
+    r_star=0.7, r_tol_frac=0.2, theta_tol_frac=0.5,
+    min_tangential_speed=0.05, stable_window=20,
+) -> Dict[str, float]:
+    """Compute T_stable, T_recover, and quality windows.
+
+    Returns a dict with keys: T_stable, T_recover, mean_r, std_r,
+    max_gap_dev, eccentricity, tangential_v_mean, stable_quality,
+    after_quality.
+
+    T_stable defaults to T_max (never stable). T_recover defaults to
+    T_max+1 (never recovered). Quality fields default to NaN.
+    """
+    T = len(pos_history)
+    if T == 0:
+        nan = float("nan")
+        return {
+            "T_stable": 0, "T_recover": 1, "mean_r": nan, "std_r": nan,
+            "max_gap_dev": nan, "eccentricity": nan,
+            "tangential_v_mean": nan, "stable_quality": nan,
+            "after_quality": nan,
+        }
+    N = pos_history[0].shape[0]
+    if frozen_mask is None:
+        exclude = torch.zeros(N, dtype=torch.bool)
+    else:
+        exclude = torch.tensor(
+            [bool(x) for x in frozen_mask], dtype=torch.bool
+        )
+
+    def _stable_at(t: int) -> bool:
+        return _is_step_stable(
+            pos_history[t], vel_history[t], target_pos_history[t],
+            exclude,
+            r_star=r_star, r_tol_frac=r_tol_frac,
+            theta_tol_frac=theta_tol_frac,
+            min_tangential_speed=min_tangential_speed, N=N,
+        )
+
+    # T_stable = first t0 s.t. all t in [t0, t0+stable_window) stable
+    T_stable = T
+    for t0 in range(0, max(1, T - stable_window + 1)):
+        if all(_stable_at(t) for t in range(t0, t0 + stable_window)):
+            T_stable = t0
+            break
+
+    # Quality over the stable window (the first window that earned T_stable)
+    if T_stable < T:
+        win_end = min(T_stable + stable_window, T)
+        pos_win = torch.stack(pos_history[T_stable:win_end], dim=0)
+        vel_win = torch.stack(vel_history[T_stable:win_end], dim=0)
+        tgt_win = torch.stack(target_pos_history[T_stable:win_end], dim=0)
+        stable_q = _stable_quality_from_window(
+            pos_win, vel_win, tgt_win, exclude,
+            r_star=r_star, r_tol_frac=r_tol_frac,
+            theta_tol_frac=theta_tol_frac, N=N,
+        )
+    else:
+        stable_q = {
+            "mean_r": float("nan"), "std_r": float("nan"),
+            "max_gap_dev": float("nan"), "eccentricity": float("nan"),
+            "tangential_v_mean": float("nan"),
+            "stable_quality": float("nan"),
+        }
+
+    # T_recover / after_quality only meaningful when there was a disturbance
+    T_recover = T + 1   # sentinel: never recovered
+    after_quality = float("nan")
+    if disturbance_step is not None and disturbance_step < T - stable_window:
+        for t0 in range(disturbance_step,
+                        max(disturbance_step + 1,
+                            T - stable_window + 1)):
+            if all(_stable_at(t) for t in range(t0, t0 + stable_window)):
+                T_recover = t0
+                break
+        if T_recover <= T:
+            win_end2 = min(T_recover + stable_window, T)
+            pos_win2 = torch.stack(
+                pos_history[T_recover:win_end2], dim=0)
+            vel_win2 = torch.stack(
+                vel_history[T_recover:win_end2], dim=0)
+            tgt_win2 = torch.stack(
+                target_pos_history[T_recover:win_end2], dim=0)
+            after = _stable_quality_from_window(
+                pos_win2, vel_win2, tgt_win2, exclude,
+                r_star=r_star, r_tol_frac=r_tol_frac,
+                theta_tol_frac=theta_tol_frac, N=N,
+            )
+            after_quality = after["stable_quality"]
+
+    return {
+        "T_stable": int(T_stable),
+        "T_recover": int(T_recover),
+        **stable_q,
+        "after_quality": float(after_quality),
+    }
+
+
+def _geometric_phase_summary(
+    per_episode_geom: list, scenario: str, disturbance_step: int,
+) -> Dict[str, Dict[str, float]]:
+    """Aggregate per-episode geometric metrics into mean±std over episodes."""
+    keys = ["T_stable", "T_recover", "mean_r", "std_r", "max_gap_dev",
+            "eccentricity", "tangential_v_mean", "stable_quality",
+            "after_quality"]
+    out: Dict[str, Dict[str, float]] = {}
+    for k in keys:
+        if k == "T_recover" and scenario != "frozen_agent":
+            continue
+        if k == "after_quality" and scenario != "frozen_agent":
+            continue
+        vals = [g.get(k) for g in per_episode_geom
+                if g.get(k) is not None
+                and not (isinstance(g.get(k), float)
+                         and math.isnan(g.get(k)))]
+        if not vals:
+            out[k] = {"mean": float("nan"), "std": float("nan")}
+        else:
+            arr = np.array(vals, dtype=float)
+            out[k] = {"mean": float(arr.mean()), "std": float(arr.std())}
+    return out
+
+
 def _save_video(frames, path, fps):
     if not frames:
         return
@@ -562,13 +892,20 @@ def main():
     else:  # cmaes-static-mlp
         exp_path = Path(args.static_mlp_exp_path)
     algo_label = args.algo
+    # For frozen_agent scenario, suffix the output folder with the
+    # disturbance mode so push and freeze don't overwrite each other.
+    mode_suffix = (
+        f"_{args.disturbance_mode}"
+        if args.scenario == "frozen_agent" else ""
+    )
     out_dir = (exp_path / "comparison_eval"
-               / f"{args.scenario}_n{args.n_agents}_{algo_label}")
+               / f"{args.scenario}_n{args.n_agents}_{algo_label}{mode_suffix}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
     print(f"Comparison eval — algo={algo_label}, scenario={args.scenario}, "
-          f"n_agents={args.n_agents}")
+          f"n_agents={args.n_agents}, "
+          f"disturbance_mode={getattr(args, 'disturbance_mode', 'n/a')}")
     print("=" * 70)
     print(f"  exp_path: {exp_path}")
     print(f"  out_dir : {out_dir}")
@@ -616,6 +953,7 @@ def main():
 
     # Run episodes.
     all_summaries = []
+    all_geom = []
     for ep in range(args.num_episodes):
         print(f"\n--- Episode {ep+1}/{args.num_episodes} ---")
         if han_model is not None:
@@ -631,6 +969,9 @@ def main():
                 save_video=(args.save_video and ep == 0),
                 max_video_frames=args.max_video_frames,
                 fps=args.fps,
+                disturbance_mode=args.disturbance_mode,
+                push_magnitude=args.push_magnitude,
+                push_direction=args.push_direction,
             )
 
         print(f"  ran {data['steps']} steps, "
@@ -647,7 +988,6 @@ def main():
         summary = _phase_summary(
             metrics, data["steps"], args.scenario, args.disturbance_step,
         )
-        all_summaries.append(summary)
         if "full" in summary:
             print(f"  F_orbit full       = {summary['full']['mean']:.3f} "
                   f"± {summary['full']['std']:.3f}")
@@ -657,7 +997,41 @@ def main():
             post = summary["full_post"]["mean"]
             print(f"  F_orbit baseline   = {base:.3f}")
             print(f"  F_orbit full_post  = {post:.3f}")
-            print(f"  Δ after freeze     = {post - base:+.3f}")
+            print(f"  Δ after disturbance= {post - base:+.3f}")
+
+        # Geometric-quality metrics (T_stable, T_recover, stable_quality, ...).
+        frozen_mask = (
+            [i == args.frozen_agent_idx for i in range(args.n_agents)]
+            if args.scenario == "frozen_agent" else None
+        )
+        geom = _compute_geometric_quality(
+            data["pos_history"], data["vel_history"],
+            data["target_pos_history"],
+            frozen_mask=frozen_mask,
+            disturbance_step=(
+                args.disturbance_step
+                if args.scenario == "frozen_agent" else None
+            ),
+            r_star=args.orbit_radius,
+            r_tol_frac=args.r_tol_frac,
+            theta_tol_frac=args.theta_tol_frac,
+            min_tangential_speed=args.min_tangential_speed,
+            stable_window=args.stable_window,
+        )
+        all_geom.append(geom)
+        all_summaries.append({**summary, **geom})
+        if geom["T_stable"] < data["steps"]:
+            print(f"  T_stable           = {geom['T_stable']} steps, "
+                  f"stable_quality={geom['stable_quality']:.3f}")
+        else:
+            print(f"  T_stable           = never (T_max={data['steps']})")
+        if args.scenario == "frozen_agent":
+            if geom["T_recover"] <= data["steps"]:
+                print(f"  T_recover          = {geom['T_recover']} steps, "
+                      f"after_quality={geom['after_quality']:.3f}")
+            else:
+                print(f"  T_recover          = never "
+                      f"(T_max={data['steps']})")
 
         # Save per-step arrays.
         np.savez(
@@ -678,9 +1052,16 @@ def main():
                         args.fps)
 
     # Save aggregate summary.
+    geom_summary = _geometric_phase_summary(
+        all_geom, args.scenario, args.disturbance_step,
+    )
     aggregate = {
         "algo": args.algo,
         "scenario": args.scenario,
+        "disturbance_mode": (
+            args.disturbance_mode
+            if args.scenario == "frozen_agent" else None
+        ),
         "n_agents": args.n_agents,
         "max_steps": args.max_steps,
         "num_episodes": args.num_episodes,
@@ -688,7 +1069,20 @@ def main():
                             if args.scenario == "frozen_agent" else None,
         "frozen_agent_idx": args.frozen_agent_idx
                             if args.scenario == "frozen_agent" else None,
+        "push_magnitude": (
+            args.push_magnitude
+            if (args.scenario == "frozen_agent"
+                and args.disturbance_mode == "push")
+            else None
+        ),
+        "push_direction": (
+            args.push_direction
+            if (args.scenario == "frozen_agent"
+                and args.disturbance_mode == "push")
+            else None
+        ),
         "per_episode": all_summaries,
+        "phase_summary": geom_summary,
         "exp_path": str(exp_path),
     }
     with open(out_dir / "summary.json", "w") as f:

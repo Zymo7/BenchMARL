@@ -1,1 +1,1 @@
-{'maxiter': 30, 'tolfun': 10000000000.0, 'tolfunhist': 10000000000.0}
+{'maxiter': 50, 'tolfun': 10000000000.0, 'tolfunhist': 10000000000.0}

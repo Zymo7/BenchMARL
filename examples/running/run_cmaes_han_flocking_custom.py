@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument("--experiment-path", type=str, default=None)
     parser.add_argument("--n-final-eval", type=int, default=10)
     parser.add_argument("--fps", type=int, default=20)
-    parser.add_argument("--max-video-frames", type=int, default=400)
+    parser.add_argument("--max-video-frames", type=int, default=800)
     parser.add_argument("--target-pos-x", type=float, default=0.0,
                         help="Initial x position of the target. "
                              "VMAS default is 0; override to recenter.")

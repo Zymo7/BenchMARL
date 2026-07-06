@@ -108,6 +108,7 @@ class VmasTask(Task):
     FLOCKING = None
     FLOCKING_LF = None
     FLOCKING_LIGHT = None
+    FLOCKING_SIGNAL = None
     DISCOVERY = None
     FOOTBALL = None
     SIMPLE_ADVERSARY = None
