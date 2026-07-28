@@ -4,6 +4,10 @@
 **/outputs/
 **/multirun/
 
+# CMA-ES runtime outputs (regenerated on every training run)
+outcmaes/*.dat
+outcmaes/*.json2
+
 # Docs
 docs/output/
 docs/source/generated/

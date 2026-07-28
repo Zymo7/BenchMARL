@@ -30,6 +30,7 @@ class CmaesHanOptimizer:
         "flocking_lf_arrival",
         "flocking_light_intensity",
         "flocking_signal_intensity",
+        "simple_tag_capture",
     ]
 
     def __init__(
@@ -50,6 +51,14 @@ class CmaesHanOptimizer:
         orbit_radius: float = 0.7,
         orbit_radius_tolerance: float = 0.3,
         dt_floor: float = 0.1,
+        catch_reward: float = 5.0,
+        proximity_weight: float = 1.0,
+        timeout_penalty: float = 1.0,
+        train_group: str = None,
+        tag_evader_group: str = None,
+        tag_num_adversaries: int = 3,
+        tag_num_obstacles: int = 0,
+        tag_capture_distance: float = 0.125,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -67,8 +76,25 @@ class CmaesHanOptimizer:
         self.orbit_radius = orbit_radius
         self.orbit_radius_tolerance = orbit_radius_tolerance
         self.dt_floor = dt_floor
+        self.catch_reward = catch_reward
+        self.proximity_weight = proximity_weight
+        self.timeout_penalty = timeout_penalty
+        self.train_group = (
+            train_group
+            if train_group is not None
+            else list(experiment.group_map.keys())[0]
+        )
+        self.tag_evader_group = tag_evader_group
+        self.tag_num_adversaries = tag_num_adversaries
+        self.tag_num_obstacles = tag_num_obstacles
+        self.tag_capture_distance = tag_capture_distance
 
         self.policy = experiment.policy
+        self.rollout_policy = (
+            experiment.group_policies[self.train_group]
+            if self.tag_evader_group is not None
+            else self.policy
+        )
 
         self._initial_abcd = han_model.get_abcd_vector().clone()
         self._best_abcd_so_far = None
@@ -100,6 +126,110 @@ class CmaesHanOptimizer:
         self._vmas_core = node
         return node
 
+    def _get_pettingzoo_tag_relative_positions(
+        self, evader_observation: torch.Tensor
+    ) -> torch.Tensor:
+        """Extract adversary positions relative to the good agent.
+
+        PettingZoo MPE ``simple_tag_v3`` observations are ordered as
+        ``[self_vel, self_pos, landmark_rel_pos, other_agent_rel_pos, ...]``.
+        This project uses one good agent, so all ``other_agent_rel_pos`` entries
+        in the good-agent observation are the adversaries.
+        """
+        start = 4 + 2 * self.tag_num_obstacles
+        end = start + 2 * self.tag_num_adversaries
+        if evader_observation.shape[-1] < end:
+            raise ValueError(
+                "PettingZoo simple_tag observation is too short for "
+                f"{self.tag_num_adversaries} adversaries and "
+                f"{self.tag_num_obstacles} obstacles: "
+                f"got {evader_observation.shape[-1]}, need at least {end}"
+            )
+        return evader_observation[..., start:end].reshape(
+            *evader_observation.shape[:-1], self.tag_num_adversaries, 2
+        )
+
+    def _set_pettingzoo_tag_evader_action(self, tensordict):
+        """Apply a deterministic escape policy to the single good agent.
+
+        The CMA-ES candidate controls only the adversary group. The good agent
+        moves directly away from its nearest adversary using the continuous MPE
+        action layout ``[noop, left, right, down, up]``.
+        """
+        if self.tag_evader_group is None:
+            return
+
+        observation = tensordict.get(
+            (self.tag_evader_group, "observation"), None
+        )
+        if observation is None:
+            raise KeyError(
+                f"Missing observation for tag evader group "
+                f"{self.tag_evader_group!r}"
+            )
+
+        relative_positions = self._get_pettingzoo_tag_relative_positions(
+            observation.float()
+        )
+        distances = torch.linalg.vector_norm(relative_positions, dim=-1)
+        nearest_index = distances.argmin(dim=-1, keepdim=True)
+        gather_index = nearest_index.unsqueeze(-1).expand(
+            *nearest_index.shape, 2
+        )
+        nearest_relative = torch.gather(
+            relative_positions, dim=-2, index=gather_index
+        ).squeeze(-2)
+        escape_direction = -nearest_relative
+        escape_direction = escape_direction / (
+            torch.linalg.vector_norm(
+                escape_direction, dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+        )
+
+        action = torch.zeros(
+            *escape_direction.shape[:-1],
+            5,
+            device=escape_direction.device,
+            dtype=escape_direction.dtype,
+        )
+        action[..., 1] = (-escape_direction[..., 0]).clamp(min=0.0, max=1.0)
+        action[..., 2] = escape_direction[..., 0].clamp(min=0.0, max=1.0)
+        action[..., 3] = (-escape_direction[..., 1]).clamp(min=0.0, max=1.0)
+        action[..., 4] = escape_direction[..., 1].clamp(min=0.0, max=1.0)
+        tensordict.set((self.tag_evader_group, "action"), action)
+
+    def _record_pettingzoo_tag_step(self, tensordict, step: int):
+        """Return capture/proximity bookkeeping for one PettingZoo tag step."""
+        observation = tensordict.get(
+            ("next", self.tag_evader_group, "observation"), None
+        )
+        if observation is None:
+            raise KeyError(
+                f"Missing next observation for tag evader group "
+                f"{self.tag_evader_group!r}"
+            )
+
+        relative_positions = self._get_pettingzoo_tag_relative_positions(
+            observation.float()
+        )
+        distances = torch.linalg.vector_norm(relative_positions, dim=-1)
+        nearest_distance = distances.min(dim=-1).values
+        caught = nearest_distance < self.tag_capture_distance
+        record = {
+            "step": step,
+            "caught_b": caught.detach().cpu(),
+            "mean_adv_to_good_b": nearest_distance.detach().cpu(),
+        }
+        return record, bool(caught.reshape(-1)[0].item())
+
+    @staticmethod
+    def _render_rgb_array(env):
+        """Render both VMAS-style and PettingZoo-style TorchRL wrappers."""
+        try:
+            return env.render(mode="rgb_array")
+        except TypeError:
+            return env.render()
+
     def _compute_fitness(self, episode_reward: float, collision_count: int, total_steps: int,
                          initial_goal_dists: torch.Tensor = None,
                          final_goal_dists: torch.Tensor = None,
@@ -108,6 +238,8 @@ class CmaesHanOptimizer:
                          pos_history=None,
                          rot_history=None,
                          target_pos_history=None,
+                         caught_step_records=None,
+                         first_env_caught_at=None,
                          ) -> float:
         """Compute fitness value from episode data based on fitness mode.
 
@@ -219,6 +351,14 @@ class CmaesHanOptimizer:
                 )
             return self._compute_flocking_signal_intensity_fitness(
                 pos_history, target_pos_history
+            )
+        elif self.fitness_mode == "simple_tag_capture":
+            return self._compute_simple_tag_capture_fitness(
+                initial_goal_dists=initial_goal_dists,
+                caught_step_records=caught_step_records,
+                first_env_caught_at=first_env_caught_at,
+                total_steps=total_steps,
+                collision_count=collision_count,
             )
         else:
             raise ValueError(f"Unknown fitness mode: {self.fitness_mode}")
@@ -370,7 +510,8 @@ class CmaesHanOptimizer:
         # orbit terms so they don't dominate the fitness.
         # Adjusted weights (方案 E): stronger At separation, weaker cohesion.
         w_C = 0.2
-        w_S = 1.0
+        # w_S = 1.0
+        w_S = 0.8
         r_star = float(self.orbit_radius)
         r_sigma = float(self.orbit_radius_tolerance)
         dt_floor = float(self.dt_floor)
@@ -551,14 +692,77 @@ class CmaesHanOptimizer:
             intensity_sum += intensity.mean().item()
         return intensity_sum / T
 
+    def _compute_simple_tag_capture_fitness(
+        self,
+        initial_goal_dists: torch.Tensor = None,
+        caught_step_records: list = None,
+        first_env_caught_at: int = None,
+        total_steps: int = 0,
+        collision_count: int = 0,
+    ) -> float:
+        """Capture fitness for ``simple_tag_v1`` (adversary pursuit).
+
+        Score components (env index 0; the per-batch-env metric the
+        CMA-ES evaluator reads from):
+
+        + ``catch_term``  = ``catch_reward`` if the good agent was
+            caught at any step (else 0).
+        - ``proximity_term`` = mean per-step distance from the closest
+          adversary to each good agent (env 0). Lower is better.
+        - ``timeout_term``  = ``timeout_penalty`` if the rollout hit
+            ``max_steps`` without a catch (else 0).
+
+        The exact reward weights default to ``(5.0, 1.0, 1.0)``. These
+        place catch above all other signals, while still rewarding
+        faster convergence and proximity pressure before the catch.
+
+        Args:
+            initial_goal_dists: (n_agents,) obs-distance at step 0.
+                Currently unused but kept for symmetry with the other
+                fitness modes.
+            caught_step_records: list of dicts collected by
+                ``_run_one_episode`` when ``fitness_mode ==
+                'simple_tag_capture'``. Each entry has ``"step"``,
+                ``"caught_b"`` ((B,) bool) and ``"mean_adv_to_good_b"``
+                ((B,) float). May be None or empty.
+            first_env_caught_at: int step at which env index 0 first
+                caught the good agent (``None`` if it never did).
+            total_steps: total steps the rollout actually executed.
+            collision_count: total collisions recorded by the env
+                reward signal (kept for symmetry, currently unused).
+        """
+        if not caught_step_records:
+            return -float(self.timeout_penalty)
+
+        # Per-step mean pursuit distance for env index 0.
+        per_step_dist_e0 = torch.stack(
+            [rec["mean_adv_to_good_b"][0] for rec in caught_step_records],
+            dim=0,
+        )
+        mean_proximity = per_step_dist_e0.mean().item()
+
+        caught = first_env_caught_at is not None
+        catch_term = float(self.catch_reward) if caught else 0.0
+        timeout_term = float(self.timeout_penalty) if (
+            not caught and total_steps >= 1
+        ) else 0.0
+
+        # Fitness: maximize catch_term, minimize proximity & timeout.
+        return (
+            catch_term
+            - self.proximity_weight * mean_proximity
+            - timeout_term
+        )
+
     def _run_one_episode(self, env, group, max_steps, policy, on_frame=None):
         """Run a single episode and return everything needed by any fitness mode."""
         td = env.reset()
 
-        # Ensure the vmas core reference is resolved. Normally cached
-        # lazily inside fitness() before the rollout loop, but the
-        # evaluate-only entry path can call _run_one_episode directly.
-        self._get_vmas_core()
+        # VMAS fitness modes read simulator state directly. PettingZoo tag
+        # instead uses the good-agent observation, so it does not depend on
+        # wrapper internals.
+        if self.tag_evader_group is None:
+            self._get_vmas_core()
 
         obs = td.get((group, "observation"))
         initial_goal_dists = torch.linalg.vector_norm(
@@ -586,8 +790,20 @@ class CmaesHanOptimizer:
         target_pos_history = []  # type: list[torch.Tensor]
         initial_pos = None
 
+        # Captured by ``simple_tag_capture`` fitness:
+        #   caught_step_records: list of dicts {step_idx, caught_b,
+        #                                     mean_adv_to_good, adv_spread}
+        # single-env metadata used to break out of the loop fast and to
+        # expose the catch step to the fitness function.
+        caught_step_records = []
+        # Stop the rollout as soon as the per-env "first env" has caught
+        # the good agent (saves CMA-ES evaluation time on successful
+        # candidates).
+        first_env_caught_at = None
+
         while not done and step < max_steps:
             td = policy(td)
+            self._set_pettingzoo_tag_evader_action(td)
             td = env.step(td)
 
             if on_frame is not None:
@@ -596,11 +812,20 @@ class CmaesHanOptimizer:
             reward = td.get(("next", group, "reward"))
             episode_reward += reward.sum().item()
 
-            info = td.get(("next", group, "info"))
+            info = td.get(("next", group, "info"), None)
             if info is not None:
                 col_rew = info.get("agent_collision_rew")
                 if col_rew is not None:
                     collision_count += (col_rew < 0).sum().item()
+
+            if (
+                self.fitness_mode == "simple_tag_capture"
+                and self.tag_evader_group is not None
+            ):
+                record, caught_now = self._record_pettingzoo_tag_step(td, step)
+                caught_step_records.append(record)
+                if first_env_caught_at is None and caught_now:
+                    first_env_caught_at = step
 
             # Inter-agent collision detection: use ABSOLUTE agent
             # positions read from the vmas core environment. We cannot
@@ -610,7 +835,7 @@ class CmaesHanOptimizer:
             # different agents' obs[:2]. The pairwise difference
             # (obs[i,:2] - obs[j,:2]) = (pos[i] - pos[j]) + (goal[j] -
             # goal[i]), which is biased by per-agent goal offsets.
-            core = self._vmas_core
+            core = getattr(self, "_vmas_core", None)
             if core is not None and hasattr(core, "agents"):
                 if n_agents is None:
                     n_agents = len(core.agents)
@@ -662,11 +887,73 @@ class CmaesHanOptimizer:
                         target.state.pos[0].detach().cpu()
                     )
 
-            done = td.get(("next", "done")).any().item()
+                # simple_tag-style bookkeeping: only active when
+                # ``fitness_mode == 'simple_tag_capture'``. Records
+                # per-step catch flag (per batch env) and per-step
+                # mean pursuit distance for env index 0.
+                if (
+                    self.fitness_mode == "simple_tag_capture"
+                    and self.tag_evader_group is None
+                ):
+                    scenario = getattr(core, "scenario", None)
+                    advs = scenario.adversaries() if scenario is not None else []
+                    goods = scenario.good_agents() if scenario is not None else []
+                    if advs and goods:
+                        adv_pos_all = torch.stack(
+                            [a.state.pos for a in advs], dim=1
+                        )    # (B, n_adv, 2)
+                        good_pos_all = torch.stack(
+                            [g.state.pos for g in goods], dim=1
+                        )  # (B, n_good, 2)
+                        # Pairwise distance per batch row.
+                        diff_ag = adv_pos_all.unsqueeze(2) - good_pos_all.unsqueeze(1)
+                        dist_ag = torch.linalg.vector_norm(diff_ag, dim=-1)  # (B, n_adv, n_good)
+                        # Contact: any (adv, good) pair within radii sum.
+                        adv_r = torch.tensor(
+                            [a.shape.radius for a in advs],
+                            device=self.device, dtype=adv_pos_all.dtype,
+                        ).view(1, -1, 1)
+                        good_r = torch.tensor(
+                            [g.shape.radius for g in goods],
+                            device=self.device, dtype=adv_pos_all.dtype,
+                        ).view(1, 1, -1)
+                        contact_ag = dist_ag < (adv_r + good_r)            # (B, n_adv, n_good)
+                        caught_step_b = contact_ag.any(dim=(1, 2))         # (B,)
+                        min_per_good = dist_ag.min(dim=1).values           # (B, n_good)
+                        mean_adv_to_good_step = min_per_good.mean(dim=-1)  # (B,)
+                        caught_step_records.append({
+                            "step": step,
+                            "caught_b": caught_step_b.detach().cpu(),
+                            "mean_adv_to_good_b": mean_adv_to_good_step.detach().cpu(),
+                        })
+                        if (first_env_caught_at is None
+                                and bool(caught_step_b[0].item())):
+                            first_env_caught_at = step
+
+            # IMPORTANT: only env index 0 is the one we evaluate. The
+            # rollout is a parallel batch and other batch rows may
+            # terminate early (initial-spawn collisions, etc.). Using
+            # ``any()`` over the whole batch would mistakenly end the
+            # rollout for env[0] as well.
+            done_t = td.get(("next", "done"))
+            if done_t.ndim > 1:
+                done = bool(done_t[0].item())
+            else:
+                done = bool(done_t.item())
             if done:
                 success = True
             td = td.get("next")
             step += 1
+
+            # For simple_tag-style tasks: once env[0] has caught the
+            # good agent, we can break the rollout early to save
+            # CMA-ES evaluation time (the catch flag is the dominant
+            # fitness signal). Other fitness modes are unaffected.
+            if (self.fitness_mode == "simple_tag_capture"
+                    and first_env_caught_at is not None
+                    and first_env_caught_at >= 0
+                    and len(caught_step_records) > 0):
+                break
 
         final_obs = td.get((group, "observation"))
         final_goal_dists = torch.linalg.vector_norm(
@@ -693,6 +980,10 @@ class CmaesHanOptimizer:
             "rot_history": rot_history,
             "target_pos_history": target_pos_history,
             "initial_pos": initial_pos,
+            # simple_tag-specific: per-step records + catch step (None
+            # if never caught).
+            "caught_step_records": caught_step_records,
+            "first_env_caught_at": first_env_caught_at,
         }
 
     def fitness(self, x: np.ndarray) -> float:
@@ -701,19 +992,21 @@ class CmaesHanOptimizer:
         self.set_abcd_from_vector(x)
         # reset_all_weights also clears the sliding windows and resets ticks.
         self.han_model.reset_all_weights()
-        # Cache the vmas core env (used for absolute position readout
-        # during inter-agent collision detection).
-        self._get_vmas_core()
+        # Cache the VMAS core env when simulator-state fitness is in use.
+        if self.tag_evader_group is None:
+            self._get_vmas_core()
 
         fitnesses = []
-        group = list(self.experiment.group_map.keys())[0]
+        group = self.train_group
         env = self.experiment.test_env
         max_steps = self.experiment.max_steps
 
         with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
             for ep in range(self.n_eval_episodes):
                 self.han_model.reset_all_weights()
-                stats = self._run_one_episode(env, group, max_steps, self.policy)
+                stats = self._run_one_episode(
+                    env, group, max_steps, self.rollout_policy
+                )
                 ep_fitness = self._compute_fitness(
                     stats["episode_reward"], stats["collision_count"], stats["step"],
                     initial_goal_dists=stats["initial_goal_dists"],
@@ -723,6 +1016,8 @@ class CmaesHanOptimizer:
                     pos_history=stats["pos_history"],
                     rot_history=stats["rot_history"],
                     target_pos_history=stats["target_pos_history"],
+                    caught_step_records=stats["caught_step_records"],
+                    first_env_caught_at=stats["first_env_caught_at"],
                 )
                 fitnesses.append(ep_fitness)
 
@@ -881,6 +1176,11 @@ class CmaesHanOptimizer:
 
         metadata = {
             "fitness_mode": self.fitness_mode,
+            "train_group": self.train_group,
+            "tag_evader_group": self.tag_evader_group,
+            "tag_num_adversaries": self.tag_num_adversaries,
+            "tag_num_obstacles": self.tag_num_obstacles,
+            "tag_capture_distance": self.tag_capture_distance,
             "total_abcd_params": self.han_model.total_abcd_params,
             "n_layers": len(layers),
             "layer_shapes": [
@@ -911,7 +1211,7 @@ class CmaesHanOptimizer:
         """Run evaluation episodes and save videos."""
         import torchvision
 
-        group = list(self.experiment.group_map.keys())[0]
+        group = self.train_group
         env = self.experiment.test_env
         max_steps = self.experiment.max_steps
 
@@ -936,7 +1236,7 @@ class CmaesHanOptimizer:
                     def on_frame(_td, _step, _cap=ep_max_frames):
                         if len(frames) < _cap:
                             try:
-                                frame = env.render(mode="rgb_array")
+                                frame = self._render_rgb_array(env)
                                 if frame is not None:
                                     frames.append(
                                         torch.tensor(frame.copy()).permute(2, 0, 1).unsqueeze(0)
@@ -946,7 +1246,7 @@ class CmaesHanOptimizer:
                 else:
                     def on_frame(_td, _step):
                         try:
-                            frame = env.render(mode="rgb_array")
+                            frame = self._render_rgb_array(env)
                             if frame is not None:
                                 frames.append(
                                     torch.tensor(frame.copy()).permute(2, 0, 1).unsqueeze(0)
@@ -955,13 +1255,19 @@ class CmaesHanOptimizer:
                             frame_errors.append(f"ep{ep} step{_step}: {e}")
 
                 try:
-                    frame = env.render(mode="rgb_array")
+                    frame = self._render_rgb_array(env)
                     if frame is not None:
                         frames.append(torch.tensor(frame.copy()).permute(2, 0, 1).unsqueeze(0))
                 except Exception as e:
                     frame_errors.append(f"ep{ep} reset: {e}")
 
-                stats = self._run_one_episode(env, group, max_steps, self.policy, on_frame=on_frame)
+                stats = self._run_one_episode(
+                    env,
+                    group,
+                    max_steps,
+                    self.rollout_policy,
+                    on_frame=on_frame,
+                )
 
                 all_rewards.append(stats["episode_reward"])
                 ep_fitness = self._compute_fitness(
@@ -973,6 +1279,8 @@ class CmaesHanOptimizer:
                     pos_history=stats["pos_history"],
                     rot_history=stats["rot_history"],
                     target_pos_history=stats["target_pos_history"],
+                    caught_step_records=stats["caught_step_records"],
+                    first_env_caught_at=stats["first_env_caught_at"],
                 )
                 all_fitnesses.append(ep_fitness)
 

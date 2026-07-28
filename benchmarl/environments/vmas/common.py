@@ -118,6 +118,7 @@ class VmasTask(Task):
     SIMPLE_SPEAKER_LISTENER = None
     SIMPLE_SPREAD = None
     SIMPLE_TAG = None
+    SIMPLE_TAG_V1 = None
     SIMPLE_WORLD_COMM = None
 
     @staticmethod

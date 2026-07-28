@@ -1,0 +1,13 @@
+defaults:
+  - vmas_simple_tag_v1_config
+  - _self_
+
+
+max_steps: 800
+num_good_agents: 1
+num_adversaries: 3
+observe_vel: True
+nearest_radius: 1.0
+bound: 1.0
+done_when_caught: True
+spawn_radius: 0.8
