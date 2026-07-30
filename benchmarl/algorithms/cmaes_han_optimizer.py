@@ -25,6 +25,7 @@ class CmaesHanOptimizer:
         "navigation_avoidance",
         "navigation_v2",
         "navigation_avoidance_v2",
+        "navigation_obs_avoidance",
         "flocking_global",
         "flocking_orbit",
         "flocking_lf_arrival",
@@ -59,6 +60,11 @@ class CmaesHanOptimizer:
         tag_num_adversaries: int = 3,
         tag_num_obstacles: int = 0,
         tag_capture_distance: float = 0.125,
+        obstacle_penalty_weight: float = 2.0,
+        obstacle_penalty_k: float = 3.0,
+        obstacle_safety_distance: float = 0.3,
+        obstacle_agent_radius: float = 0.10,
+        obstacle_obstacle_radius: float = 0.15,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -88,6 +94,12 @@ class CmaesHanOptimizer:
         self.tag_num_adversaries = tag_num_adversaries
         self.tag_num_obstacles = tag_num_obstacles
         self.tag_capture_distance = tag_capture_distance
+        # Navigation-obs-avoidance fitness parameters.
+        self.obstacle_penalty_weight = obstacle_penalty_weight
+        self.obstacle_penalty_k = obstacle_penalty_k
+        self.obstacle_safety_distance = obstacle_safety_distance
+        self.obstacle_agent_radius = obstacle_agent_radius
+        self.obstacle_obstacle_radius = obstacle_obstacle_radius
 
         self.policy = experiment.policy
         self.rollout_policy = (
@@ -240,6 +252,7 @@ class CmaesHanOptimizer:
                          target_pos_history=None,
                          caught_step_records=None,
                          first_env_caught_at=None,
+                         obstacle_dist_history=None,
                          ) -> float:
         """Compute fitness value from episode data based on fitness mode.
 
@@ -310,6 +323,60 @@ class CmaesHanOptimizer:
                     + w_success * success_term
                     + w_final * final_term
                     - w_collision * mean_collision_ratio)
+        elif self.fitness_mode == "navigation_obs_avoidance":
+            if initial_goal_dists is None or final_goal_dists is None:
+                raise ValueError(
+                    "navigation_obs_avoidance mode requires initial/final "
+                    "goal distances"
+                )
+            if obstacle_dist_history is None:
+                raise ValueError(
+                    "navigation_obs_avoidance mode requires "
+                    "obstacle_dist_history"
+                )
+            eps = 1e-6
+            progress = ((initial_goal_dists - final_goal_dists).clamp(min=0.0)
+                        / (initial_goal_dists + eps))
+            mask = (initial_goal_dists > eps)
+            if mask.any():
+                mean_progress = progress[mask].mean().item()
+            else:
+                mean_progress = 0.0
+            success_term = 1.0 if success else 0.0
+            mean_final = (
+                final_goal_dists.mean().item() if mask.any() else 0.0
+            )
+            final_term = -mean_final
+
+            # Obstacle penalty: time-averaged exp(-k * r), where r is
+            # the normalized safety margin. r=1 → pen ~ exp(-k) ~ 0;
+            # r=0 (touching obstacle) → pen = 1.0.
+            if len(obstacle_dist_history) > 0:
+                obs_dists = torch.stack(
+                    [d.float() for d in obstacle_dist_history]
+                )
+                d_min = (
+                    self.obstacle_agent_radius
+                    + self.obstacle_obstacle_radius
+                )
+                d_safe = max(self.obstacle_safety_distance, d_min + 1e-6)
+                r = ((obs_dists - d_min) / (d_safe - d_min)).clamp(0.0, 1.0)
+                pen = torch.exp(-self.obstacle_penalty_k * r)
+                mean_obstacle_pen = pen.mean().item()
+            else:
+                # No obstacles encountered → no penalty.
+                mean_obstacle_pen = 0.0
+
+            w_progress = 3.0
+            w_success = 5.0
+            w_final = 1.0
+            w_obstacle = self.obstacle_penalty_weight
+            return (
+                w_progress * mean_progress
+                + w_success * success_term
+                + w_final * final_term
+                - w_obstacle * mean_obstacle_pen
+            )
         elif self.fitness_mode == "flocking_global":
             if pos_history is None or rot_history is None:
                 raise ValueError(
@@ -768,6 +835,12 @@ class CmaesHanOptimizer:
         initial_goal_dists = torch.linalg.vector_norm(
             obs[..., :2].float(), dim=-1
         )
+        # For the navigation_obs_avoidance task the observation layout is
+        # [pos(2), vel(2), goal_rel(2), nearest_obstacle_rel(2), has_flag(1)],
+        # so obs[..., :2] is the absolute agent position rather than the
+        # goal-relative offset. We instead compute initial / final goal
+        # distances from simulator state (single-env, env index 0).
+        use_sim_goal_dist = self.fitness_mode == "navigation_obs_avoidance"
 
         episode_reward = 0.0
         collision_count = 0
@@ -800,6 +873,11 @@ class CmaesHanOptimizer:
         # the good agent (saves CMA-ES evaluation time on successful
         # candidates).
         first_env_caught_at = None
+
+        # Per-step obstacle distance (scalar, env index 0) used by the
+        # navigation_obs_avoidance fitness mode. Populated only when
+        # the active fitness mode requests it.
+        obstacle_dist_history = []
 
         while not done and step < max_steps:
             td = policy(td)
@@ -877,6 +955,36 @@ class CmaesHanOptimizer:
                     initial_pos = pos_cpu.clone()
                 pos_history.append(pos_cpu)
                 rot_history.append(rot_cpu)
+
+                # navigation_obs_avoidance bookkeeping: per-step minimum
+                # distance from the agent to any obstacle (env index 0).
+                # Obstacles are landmarks that are NOT the goal. Only
+                # collected when the active fitness mode requests it.
+                if use_sim_goal_dist:
+                    scenario = getattr(core, "scenario", None)
+                    obstacles = (
+                        scenario.obstacles if scenario is not None else []
+                    )
+                    if obstacles:
+                        obs_pos_stack = torch.stack(
+                            [o.state.pos[0] for o in obstacles], dim=0
+                        )                                        # (N, 2)
+                        diff_obs = (
+                            pos_stack[0].unsqueeze(0)
+                            - obs_pos_stack
+                        )                                        # (N, 2)
+                        obs_dist = torch.linalg.vector_norm(
+                            diff_obs, dim=-1
+                        )                                        # (N,)
+                        obstacle_dist_history.append(
+                            obs_dist.min().detach().cpu()
+                        )
+                    else:
+                        # No obstacles: record a large value so the
+                        # exp(-k*r) penalty is ~0.
+                        obstacle_dist_history.append(
+                            torch.tensor(float(self.obstacle_safety_distance * 4))
+                        )
 
                 # Record target absolute position (env index 0) for
                 # flocking_orbit. The target is the action_script-driven
@@ -959,6 +1067,30 @@ class CmaesHanOptimizer:
         final_goal_dists = torch.linalg.vector_norm(
             final_obs[..., :2].float(), dim=-1
         )
+        # When the obs layout encodes absolute positions rather than
+        # goal-relative offsets, recompute goal distances from simulator
+        # state. ``initial_goal_dists`` was also recomputed below to
+        # keep the contract consistent across modes.
+        if use_sim_goal_dist and getattr(self, "_vmas_core", None) is not None:
+            core = self._vmas_core
+            agent_pos_init = core.agents[0].state.pos[0]
+            agent_pos_final = agent_pos_init  # default: fall back if step==0
+            goal_pos = core.agents[0].goal.state.pos[0]
+            # Walk the pos_history collected in this episode: the last
+            # CPU entry is the post-step absolute position of the agent.
+            # If the loop never ran, fall back to the current state.pos.
+            if pos_history:
+                # pos_history is parallel-agent (n_agents, 2); for single
+                # agent tasks index 0 is our agent.
+                agent_pos_final = pos_history[-1][0].to(self.device)
+            init_dist = torch.linalg.vector_norm(
+                agent_pos_init - goal_pos
+            )
+            final_dist = torch.linalg.vector_norm(
+                agent_pos_final - goal_pos
+            )
+            initial_goal_dists = init_dist.unsqueeze(0)
+            final_goal_dists = final_dist.unsqueeze(0)
 
         # Per-agent collision ratio = (steps in collision) / total_steps.
         # If n_agents is 1, no inter-agent collisions possible.
@@ -984,6 +1116,10 @@ class CmaesHanOptimizer:
             # if never caught).
             "caught_step_records": caught_step_records,
             "first_env_caught_at": first_env_caught_at,
+            # navigation_obs_avoidance-specific: per-step min agent→obstacle
+            # distance (CPU scalar, env index 0). Empty list if the
+            # fitness mode does not request it.
+            "obstacle_dist_history": obstacle_dist_history,
         }
 
     def fitness(self, x: np.ndarray) -> float:
@@ -1018,6 +1154,7 @@ class CmaesHanOptimizer:
                     target_pos_history=stats["target_pos_history"],
                     caught_step_records=stats["caught_step_records"],
                     first_env_caught_at=stats["first_env_caught_at"],
+                    obstacle_dist_history=stats["obstacle_dist_history"],
                 )
                 fitnesses.append(ep_fitness)
 
@@ -1281,6 +1418,7 @@ class CmaesHanOptimizer:
                     target_pos_history=stats["target_pos_history"],
                     caught_step_records=stats["caught_step_records"],
                     first_env_caught_at=stats["first_env_caught_at"],
+                    obstacle_dist_history=stats["obstacle_dist_history"],
                 )
                 all_fitnesses.append(ep_fitness)
 
