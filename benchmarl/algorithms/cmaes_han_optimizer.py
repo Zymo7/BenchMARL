@@ -60,11 +60,23 @@ class CmaesHanOptimizer:
         tag_num_adversaries: int = 3,
         tag_num_obstacles: int = 0,
         tag_capture_distance: float = 0.125,
-        obstacle_penalty_weight: float = 2.0,
+        # navigation_obs_avoidance fitness parameters.
+        # NOTE: ``obstacle_penalty_weight`` is kept under the same name
+        # for backward compatibility with existing run-scripts but its
+        # semantics changed: it now scales the *peak* (max-over-steps)
+        # obstacle penalty rather than the time-averaged one. Use
+        # ``w_progress / w_success / w_final / w_peak / w_collision`` to
+        # rebalance the fitness components.
+        obstacle_penalty_weight: float = 1.5,
         obstacle_penalty_k: float = 3.0,
         obstacle_safety_distance: float = 0.3,
         obstacle_agent_radius: float = 0.10,
         obstacle_obstacle_radius: float = 0.15,
+        w_progress: float = 1.5,
+        w_success: float = 2.0,
+        w_final: float = 0.5,
+        w_peak: float = 1.5,
+        w_collision: float = 1.0,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -95,7 +107,15 @@ class CmaesHanOptimizer:
         self.tag_num_obstacles = tag_num_obstacles
         self.tag_capture_distance = tag_capture_distance
         # Navigation-obs-avoidance fitness parameters.
-        self.obstacle_penalty_weight = obstacle_penalty_weight
+        # ``obstacle_penalty_weight`` is aliased to ``w_peak`` so that
+        # passing the old --obstacle-penalty-weight CLI flag still
+        # controls the obstacle term (now the *peak* penalty rather than
+        # the time-averaged one).
+        self.w_progress = w_progress
+        self.w_success = w_success
+        self.w_final = w_final
+        self.w_peak = w_peak if w_peak != 1.5 else obstacle_penalty_weight
+        self.w_collision = w_collision
         self.obstacle_penalty_k = obstacle_penalty_k
         self.obstacle_safety_distance = obstacle_safety_distance
         self.obstacle_agent_radius = obstacle_agent_radius
@@ -348,9 +368,12 @@ class CmaesHanOptimizer:
             )
             final_term = -mean_final
 
-            # Obstacle penalty: time-averaged exp(-k * r), where r is
-            # the normalized safety margin. r=1 → pen ~ exp(-k) ~ 0;
-            # r=0 (touching obstacle) → pen = 1.0.
+            # Obstacle penalty: PEAK (max over episode steps) instead of
+            # time-averaged. This avoids the failure mode where a short
+            # "crash-through" episode dilutes a brief collision into a
+            # near-zero penalty. Peak penalty is bounded in [exp(-k), 1]:
+            # - r=1 (agent in d_safe band or beyond) → exp(-k) ≈ 0
+            # - r=0 (touching obstacle) → 1.0
             if len(obstacle_dist_history) > 0:
                 obs_dists = torch.stack(
                     [d.float() for d in obstacle_dist_history]
@@ -362,20 +385,23 @@ class CmaesHanOptimizer:
                 d_safe = max(self.obstacle_safety_distance, d_min + 1e-6)
                 r = ((obs_dists - d_min) / (d_safe - d_min)).clamp(0.0, 1.0)
                 pen = torch.exp(-self.obstacle_penalty_k * r)
-                mean_obstacle_pen = pen.mean().item()
+                peak_obstacle_pen = pen.max().item()
+                # collision_touched = 1 if any step had agent actually
+                # overlapping an obstacle (distance <= d_min), else 0.
+                collision_touched = float(
+                    (obs_dists <= d_min + eps).any().item()
+                )
             else:
                 # No obstacles encountered → no penalty.
-                mean_obstacle_pen = 0.0
+                peak_obstacle_pen = 0.0
+                collision_touched = 0.0
 
-            w_progress = 3.0
-            w_success = 5.0
-            w_final = 1.0
-            w_obstacle = self.obstacle_penalty_weight
             return (
-                w_progress * mean_progress
-                + w_success * success_term
-                + w_final * final_term
-                - w_obstacle * mean_obstacle_pen
+                self.w_progress * mean_progress
+                + self.w_success * success_term
+                + self.w_final * final_term
+                - self.w_peak * peak_obstacle_pen
+                - self.w_collision * collision_touched
             )
         elif self.fitness_mode == "flocking_global":
             if pos_history is None or rot_history is None:

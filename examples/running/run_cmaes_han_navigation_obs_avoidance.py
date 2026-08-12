@@ -43,20 +43,39 @@ def parse_args():
                         help="Detection range for the nearest-obstacle feature.")
     parser.add_argument("--world-spawning-x", type=float, default=1.0)
     parser.add_argument("--world-spawning-y", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=800)
 
     # Fitness configuration (navigation_obs_avoidance only — other modes
     # are listed for API parity but the script forces the obs_avoidance mode)
     parser.add_argument("--fitness-mode", type=str,
                         default="navigation_obs_avoidance",
                         choices=CmaesHanOptimizer.FITNESS_MODES)
-    parser.add_argument("--obstacle-penalty-weight", type=float, default=2.0,
-                        help="Weight w_obs in front of the time-averaged "
-                             "exp(-k·r) penalty.")
+    # The new fitness formula is:
+    #   fitness = w_progress * mean_progress
+    #           + w_success  * success
+    #           + w_final    * (-mean_final_dist)
+    #           - w_peak     * max_over_steps(exp(-k·r))
+    #           - w_collision * (1 if any step had d <= d_min else 0)
+    # ``--obstacle-penalty-weight`` is kept under the old name for
+    # backward compatibility but its semantics changed: it now scales the
+    # PEAK (max-over-steps) obstacle penalty rather than the time-averaged
+    # one. Use ``--w-peak`` to override explicitly.
+    parser.add_argument("--obstacle-penalty-weight", type=float, default=1.5,
+                        help="Backward-compat alias for --w-peak.")
     parser.add_argument("--obstacle-penalty-k", type=float, default=3.0,
                         help="Steepness of the exponential decay; pen=exp(-k·r).")
     parser.add_argument("--obstacle-safety-distance", type=float, default=0.3,
                         help="Distance beyond which the penalty is ~0.")
+    parser.add_argument("--w-progress", type=float, default=1.5,
+                        help="Weight on mean_progress.")
+    parser.add_argument("--w-success", type=float, default=2.0,
+                        help="Weight on success (binary 0/1).")
+    parser.add_argument("--w-final", type=float, default=0.5,
+                        help="Weight on -mean_final_goal_dist.")
+    parser.add_argument("--w-peak", type=float, default=1.5,
+                        help="Weight on peak (max-over-steps) obstacle penalty.")
+    parser.add_argument("--w-collision", type=float, default=1.0,
+                        help="Weight on collision_touched (binary 0/1).")
 
     # CMA-ES parameters
     parser.add_argument("--cmaes-gens", type=int, default=15)
@@ -88,7 +107,7 @@ def parse_args():
     parser.add_argument("--experiment-path", type=str, default=None)
     parser.add_argument("--n-final-eval", type=int, default=10)
     parser.add_argument("--fps", type=int, default=20)
-    parser.add_argument("--max-video-frames", type=int, default=400)
+    parser.add_argument("--max-video-frames", type=int, default=800)
 
     return parser.parse_args()
 
@@ -164,9 +183,11 @@ if __name__ == "__main__":
           f"max_steps={args.max_steps}")
     print(f"Fitness mode: {args.fitness_mode}")
     if args.fitness_mode == "navigation_obs_avoidance":
-        print(f"  obstacle_penalty_weight={args.obstacle_penalty_weight}, "
-              f"k={args.obstacle_penalty_k}, "
+        print(f"  penalty: w_peak={args.w_peak}, k={args.obstacle_penalty_k}, "
               f"safety_distance={args.obstacle_safety_distance}")
+        print(f"  reward:  w_progress={args.w_progress}, "
+              f"w_success={args.w_success}, w_final={args.w_final}")
+        print(f"  collision: w_collision={args.w_collision}")
     print(f"HAN: hidden={args.hidden_size}, "
           f"window_size={args.window_size}, "
           f"f_nn={args.f_nn}, f_hebb={args.f_hebb}")
@@ -221,6 +242,11 @@ if __name__ == "__main__":
             obstacle_safety_distance=args.obstacle_safety_distance,
             obstacle_agent_radius=args.agent_radius,
             obstacle_obstacle_radius=args.obstacle_radius,
+            w_progress=args.w_progress,
+            w_success=args.w_success,
+            w_final=args.w_final,
+            w_peak=args.w_peak,
+            w_collision=args.w_collision,
         )
         if abcd_path.exists():
             optimizer._best_abcd_so_far = np.load(str(abcd_path))
@@ -268,6 +294,11 @@ if __name__ == "__main__":
             obstacle_safety_distance=args.obstacle_safety_distance,
             obstacle_agent_radius=args.agent_radius,
             obstacle_obstacle_radius=args.obstacle_radius,
+            w_progress=args.w_progress,
+            w_success=args.w_success,
+            w_final=args.w_final,
+            w_peak=args.w_peak,
+            w_collision=args.w_collision,
         )
 
         best_abcd = optimizer.run()
