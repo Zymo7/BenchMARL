@@ -1,0 +1,28 @@
+name: hgn
+
+# Hidden dimension of every per-agent node state. The node state is a pure
+# black-box D_h-vector with no pre-defined semantic split.
+d_h: 18
+
+# Number of message-passing rounds per env step.
+# Default 1 (not 2): with shared W_edge and share_params, two rounds of
+# message passing smooths the per-agent hidden states too aggressively
+# (over-smoothing) and CMA-ES loses the per-agent identity signal. One
+# round keeps the message-passing contribution while preserving enough
+# per-agent variation for the policy to act differently per agent.
+n_message_steps: 1
+
+# Topology: "full" connects every (i, j) pair with i != j;
+# "from_pos" builds edges from per-step agent positions within edge_radius.
+topology: full
+edge_radius: null
+
+# HAN Hebbian hyperparameters (same semantics as HanConfig).
+lr_hebb: 0.01
+weight_init: 1.0
+window_size: 10
+f_nn: 4
+f_hebb: 1
+activation_class: null
+activation_kwargs: null
+num_feature_dims: 1

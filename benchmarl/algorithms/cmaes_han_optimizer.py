@@ -32,6 +32,7 @@ class CmaesHanOptimizer:
         "flocking_light_intensity",
         "flocking_signal_intensity",
         "simple_tag_capture",
+        "hgn_formation_v1",
     ]
 
     def __init__(
@@ -61,22 +62,41 @@ class CmaesHanOptimizer:
         tag_num_obstacles: int = 0,
         tag_capture_distance: float = 0.125,
         # navigation_obs_avoidance fitness parameters.
-        # NOTE: ``obstacle_penalty_weight`` is kept under the same name
-        # for backward compatibility with existing run-scripts but its
-        # semantics changed: it now scales the *peak* (max-over-steps)
-        # obstacle penalty rather than the time-averaged one. Use
-        # ``w_progress / w_success / w_final / w_peak / w_collision`` to
-        # rebalance the fitness components.
-        obstacle_penalty_weight: float = 1.5,
-        obstacle_penalty_k: float = 3.0,
+        #
+        # The fitness is now intentionally simple so that HAN's online
+        # Hebbian weight updates can converge toward a stable attractor
+        # rather than chasing a multi-component composite reward:
+        #
+        #     if reached AND not collided:
+        #         fitness = +success_reward
+        #     else:
+        #         fitness = - final_weight   * final_goal_dist
+        #                 - penalty_weight  * penalty_ratio
+        #                 - timeout_penalty  (when the episode ran out
+        #                                     of steps without success)
+        #
+        # ``penalty_ratio`` = (steps with d_obs <= d_safety) / total_steps,
+        # which is a single episode-end scalar (no time segmentation).
+        #
+        # The old ``obstacle_penalty_weight / obstacle_penalty_k /
+        # obstacle_safety_distance`` knob trio is preserved under the
+        # same names but now they only feed ``penalty_ratio`` via the
+        # safety-distance threshold; ``obstacle_penalty_weight`` is
+        # reused as the alias for ``penalty_weight`` to keep older
+        # run-scripts working.
+        obstacle_penalty_weight: float = 2.0,
         obstacle_safety_distance: float = 0.3,
         obstacle_agent_radius: float = 0.10,
         obstacle_obstacle_radius: float = 0.15,
-        w_progress: float = 1.5,
-        w_success: float = 2.0,
-        w_final: float = 0.5,
-        w_peak: float = 1.5,
-        w_collision: float = 1.0,
+        success_reward: float = 5.0,
+        final_weight: float = 1.0,
+        penalty_weight: float = 2.0,
+        nav_timeout_penalty: float = 2.0,
+        # HGN formation-control fitness parameters.
+        formation_reach_radius: float = 0.10,
+        formation_collision_penalty: float = 2.0,
+        formation_timeout_penalty: float = 2.0,
+        formation_tail_frac: float = 0.10,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -107,19 +127,22 @@ class CmaesHanOptimizer:
         self.tag_num_obstacles = tag_num_obstacles
         self.tag_capture_distance = tag_capture_distance
         # Navigation-obs-avoidance fitness parameters.
-        # ``obstacle_penalty_weight`` is aliased to ``w_peak`` so that
-        # passing the old --obstacle-penalty-weight CLI flag still
-        # controls the obstacle term (now the *peak* penalty rather than
-        # the time-averaged one).
-        self.w_progress = w_progress
-        self.w_success = w_success
-        self.w_final = w_final
-        self.w_peak = w_peak if w_peak != 1.5 else obstacle_penalty_weight
-        self.w_collision = w_collision
-        self.obstacle_penalty_k = obstacle_penalty_k
+        self.success_reward = success_reward
+        self.final_weight = final_weight
+        # ``obstacle_penalty_weight`` is preserved under its old name as
+        # the backward-compat alias for ``penalty_weight``.
+        self.penalty_weight = (
+            penalty_weight if penalty_weight != 2.0 else obstacle_penalty_weight
+        )
+        self.nav_timeout_penalty = nav_timeout_penalty
         self.obstacle_safety_distance = obstacle_safety_distance
         self.obstacle_agent_radius = obstacle_agent_radius
         self.obstacle_obstacle_radius = obstacle_obstacle_radius
+        # HGN formation-control fitness parameters.
+        self.formation_reach_radius = formation_reach_radius
+        self.formation_collision_penalty = formation_collision_penalty
+        self.formation_timeout_penalty = formation_timeout_penalty
+        self.formation_tail_frac = formation_tail_frac
 
         self.policy = experiment.policy
         self.rollout_policy = (
@@ -344,6 +367,12 @@ class CmaesHanOptimizer:
                     + w_final * final_term
                     - w_collision * mean_collision_ratio)
         elif self.fitness_mode == "navigation_obs_avoidance":
+            # Sparse fitness: give a fixed reward for "arrived safely",
+            # otherwise charge for how far away the agent ended up plus
+            # how much of the episode it spent inside the safety band of
+            # an obstacle. The composite is just two scalars + a binary
+            # success term so that HAN's online weight updates have a
+            # simple target to converge to.
             if initial_goal_dists is None or final_goal_dists is None:
                 raise ValueError(
                     "navigation_obs_avoidance mode requires initial/final "
@@ -354,55 +383,49 @@ class CmaesHanOptimizer:
                     "navigation_obs_avoidance mode requires "
                     "obstacle_dist_history"
                 )
-            eps = 1e-6
-            progress = ((initial_goal_dists - final_goal_dists).clamp(min=0.0)
-                        / (initial_goal_dists + eps))
-            mask = (initial_goal_dists > eps)
-            if mask.any():
-                mean_progress = progress[mask].mean().item()
-            else:
-                mean_progress = 0.0
-            success_term = 1.0 if success else 0.0
-            mean_final = (
-                final_goal_dists.mean().item() if mask.any() else 0.0
-            )
-            final_term = -mean_final
+            if len(obstacle_dist_history) == 0 or total_steps <= 0:
+                # Degenerate: nothing to evaluate.
+                return 0.0
 
-            # Obstacle penalty: PEAK (max over episode steps) instead of
-            # time-averaged. This avoids the failure mode where a short
-            # "crash-through" episode dilutes a brief collision into a
-            # near-zero penalty. Peak penalty is bounded in [exp(-k), 1]:
-            # - r=1 (agent in d_safe band or beyond) → exp(-k) ≈ 0
-            # - r=0 (touching obstacle) → 1.0
-            if len(obstacle_dist_history) > 0:
-                obs_dists = torch.stack(
-                    [d.float() for d in obstacle_dist_history]
-                )
-                d_min = (
-                    self.obstacle_agent_radius
-                    + self.obstacle_obstacle_radius
-                )
-                d_safe = max(self.obstacle_safety_distance, d_min + 1e-6)
-                r = ((obs_dists - d_min) / (d_safe - d_min)).clamp(0.0, 1.0)
-                pen = torch.exp(-self.obstacle_penalty_k * r)
-                peak_obstacle_pen = pen.max().item()
-                # collision_touched = 1 if any step had agent actually
-                # overlapping an obstacle (distance <= d_min), else 0.
-                collision_touched = float(
-                    (obs_dists <= d_min + eps).any().item()
-                )
-            else:
-                # No obstacles encountered → no penalty.
-                peak_obstacle_pen = 0.0
-                collision_touched = 0.0
-
-            return (
-                self.w_progress * mean_progress
-                + self.w_success * success_term
-                + self.w_final * final_term
-                - self.w_peak * peak_obstacle_pen
-                - self.w_collision * collision_touched
+            # Episode-level collision flag: did the agent ever touch an
+            # obstacle (distance <= d_min)?
+            d_min = (
+                self.obstacle_agent_radius
+                + self.obstacle_obstacle_radius
             )
+            d_safe = max(self.obstacle_safety_distance, d_min + 1e-6)
+            obs_dists = torch.stack(
+                [d.float() for d in obstacle_dist_history]
+            )
+            collided = bool((obs_dists <= d_min + 1e-6).any().item())
+
+            # Mean final distance to goal across the (single) agent.
+            mean_final = final_goal_dists.mean().item()
+
+            # Fraction of episode steps the agent spent inside any
+            # obstacle's safety band.
+            penalty_ratio = (
+                (obs_dists <= d_safe).float().mean().item()
+            )
+
+            if success and not collided:
+                # The "good" outcome: agent reached the goal without
+                # touching any obstacle. Single, easy-to-optimise target.
+                return float(self.success_reward)
+
+            # Failure branch: agent did not arrive safely. Encourage
+            # proximity to the goal while penalising how much of the
+            # episode was spent in the safety band.
+            fitness = (
+                - self.final_weight * mean_final
+                - self.penalty_weight * penalty_ratio
+            )
+            # Extra timeout penalty when the episode ran the full
+            # ``total_steps`` without success (i.e. the agent wandered
+            # or got stuck rather than converging).
+            if not success and total_steps >= self.experiment.max_steps:
+                fitness -= self.nav_timeout_penalty
+            return float(fitness)
         elif self.fitness_mode == "flocking_global":
             if pos_history is None or rot_history is None:
                 raise ValueError(
@@ -452,6 +475,12 @@ class CmaesHanOptimizer:
                 first_env_caught_at=first_env_caught_at,
                 total_steps=total_steps,
                 collision_count=collision_count,
+            )
+        elif self.fitness_mode == "hgn_formation_v1":
+            return self._compute_hgn_formation_fitness(
+                pos_history=pos_history,
+                target_pos_history=target_pos_history,
+                total_steps=total_steps,
             )
         else:
             raise ValueError(f"Unknown fitness mode: {self.fitness_mode}")
@@ -847,6 +876,97 @@ class CmaesHanOptimizer:
             - timeout_term
         )
 
+    def _compute_hgn_formation_fitness(
+        self,
+        pos_history: list = None,
+        target_pos_history: list = None,
+        total_steps: int = 0,
+    ) -> float:
+        """HGN formation-control fitness (``hgn_formation_v1``).
+
+        Sparse + single-target design, mirroring ``obs_avoidance_fitness.md``
+        v3 — one plateau target, one monotonic failure signal, no temporal
+        segmentation:
+
+            if reached AND not collided:
+                fitness = +formation_success_reward  (default +5.0)
+            else:
+                fitness = -formation_final_weight * mean_dist
+                        - formation_collision_penalty (if tail collided)
+                        - formation_timeout_penalty   (if ran max_steps)
+
+        ``target_pos_history`` is unused here — targets are *static* (or
+        moving uniformly in moving-target mode), and the scenario caches
+        them on the env. We recover them from the simulator's scenario
+        object via ``self._get_vmas_core().scenario.formation_targets``.
+        """
+        if not pos_history:
+            return 0.0
+
+        final_pos = pos_history[-1]                       # (N, 2)
+        core = getattr(self, "_vmas_core", None)
+        if core is None:
+            core = self._get_vmas_core()
+        scenario = getattr(core, "scenario", None)
+        if scenario is None or not hasattr(scenario, "formation_targets"):
+            # No scenario targets: fall back to first target_pos_history
+            # entry (set by reset_world_at / pre_step). This branch is only
+            # hit if the user pointed ``hgn_formation_v1`` at a non-formation
+            # env.
+            if not target_pos_history:
+                return 0.0
+            target = target_pos_history[-1]              # (2,) single target
+            # Cannot compare per-agent distances with a single global
+            # target. Return 0 — caller should pick the right mode.
+            return 0.0
+
+        target = scenario.formation_targets                # (N, 2)
+        if target.device != final_pos.device:
+            target = target.to(final_pos.device)
+
+        # Per-agent distance to assigned formation slot.
+        d = torch.linalg.vector_norm(final_pos - target, dim=-1)   # (N,)
+        mean_dist = d.mean().item()
+
+        # Reached iff every agent is within reach_radius of its slot.
+        reached = bool((d <= self.formation_reach_radius).all().item())
+
+        # Collided iff any pair of agents got within 2*agent_radius in the
+        # tail of the episode.
+        collided = self._formation_tail_collided(pos_history)
+
+        if reached and not collided:
+            return float(self.success_reward)
+
+        # Failure branch.
+        fitness = -self.final_weight * mean_dist
+        if collided:
+            fitness -= self.formation_collision_penalty
+        if total_steps >= self.experiment.max_steps and not reached:
+            fitness -= self.formation_timeout_penalty
+        return float(fitness)
+
+    def _formation_tail_collided(self, pos_history: list) -> bool:
+        """Return True if any pair of agents touched in the tail of the
+        episode. Pair collision radius uses the VMAS default 0.05 + 0.05
+        (= 2 * default agent_radius)."""
+        if len(pos_history) < 2:
+            return False
+        tail = max(1, int(len(pos_history) * self.formation_tail_frac))
+        tail_history = pos_history[-tail:]
+        collision_dist = 2 * 0.05  # default agent_radius
+        for pos in tail_history:
+            if pos.shape[0] < 2:
+                continue
+            diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+            dist = torch.linalg.vector_norm(diff, dim=-1)
+            N = dist.shape[0]
+            eye = torch.eye(N, device=dist.device, dtype=torch.bool)
+            dist = dist.masked_fill(eye, float("inf"))
+            if (dist < collision_dist).any().item():
+                return True
+        return False
+
     def _run_one_episode(self, env, group, max_steps, policy, on_frame=None):
         """Run a single episode and return everything needed by any fitness mode."""
         td = env.reset()
@@ -1207,7 +1327,7 @@ class CmaesHanOptimizer:
         print(f"  Layers: [{layer_info}]")
         print(f"  pop_size={self.pop_size}, sigma0={self.sigma0}, max_gens={self.max_gens}")
         print(f"  fitness_mode={self.fitness_mode}, n_eval_episodes={self.n_eval_episodes}")
-        print(f"  HanModel: window_size={self.han_model.layers[0].window_size}, "
+        print(f"  HanModel: window_size={layers[0].window_size}, "
               f"f_nn={self.han_model.f_nn}, f_hebb={self.han_model.f_hebb}, "
               f"update_interval={self.han_model._update_interval}")
 

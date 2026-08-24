@@ -19,6 +19,7 @@ from .lstm import Lstm, LstmConfig
 from .hebbian import Hebbian, HebbianConfig
 from .full_hebbian import FullHebbianModel, FullHebbianConfig
 from .han import HanConfig, HanModel
+from .hgn import HgnConfig, HgnModel
 from .mlp import Mlp, MlpConfig
 from .static_mlp import StaticMlpConfig, StaticMlpModel
 
@@ -29,6 +30,8 @@ classes = [
     "FullHebbianConfig",
     "HanModel",
     "HanConfig",
+    "HgnModel",
+    "HgnConfig",
     "Mlp",
     "MlpConfig",
     "StaticMlpModel",
@@ -49,6 +52,7 @@ model_config_registry = {
     "hebbian": HebbianConfig,
     "full_hebbian": FullHebbianConfig,
     "han": HanConfig,
+    "hgn": HgnConfig,
     "mlp": MlpConfig,
     "static_mlp": StaticMlpConfig,
     "gnn": GnnConfig,

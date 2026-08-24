@@ -112,6 +112,8 @@ class VmasTask(Task):
     FLOCKING_SIGNAL = None
     DISCOVERY = None
     FOOTBALL = None
+    FORMATION = None
+    BENCHMARL_HGN_FORMATION = None
     SIMPLE_ADVERSARY = None
     SIMPLE_CRYPTO = None
     SIMPLE_PUSH = None

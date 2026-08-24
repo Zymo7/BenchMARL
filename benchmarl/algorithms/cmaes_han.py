@@ -242,6 +242,23 @@ class CmaesHan(Algorithm):
 
         return None
 
+    def get_hgn_model(self, group: str = None):
+        """Navigate the policy to find the HgnModel instance (sister of
+        :meth:`get_han_model`)."""
+        if group is None:
+            group = list(self.group_map.keys())[0]
+
+        policy = self._policies_for_loss.get(group)
+        if policy is None:
+            policy = self.get_policy_for_loss(group)
+
+        from benchmarl.models.hgn import HgnModel
+        for sub_module in policy.module.modules():
+            if isinstance(sub_module, HgnModel):
+                return sub_module
+
+        return None
+
 
 @dataclass
 class CmaesHanConfig(AlgorithmConfig):

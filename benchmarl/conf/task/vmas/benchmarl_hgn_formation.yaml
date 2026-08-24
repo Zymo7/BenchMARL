@@ -1,0 +1,35 @@
+defaults:
+  - _self_
+
+# Episode length.
+max_steps: 200
+
+# Swarm size.
+n_agents: 6
+
+# Formation shape: circle (default), line, v, or grid.
+formation_type: circle
+
+# Geometry of the target formation. formation_radius should be slightly
+# larger than spawn_cluster_radius so the formation slots sit *outside*
+# the spawn cluster — agents have a clear "go outward" direction.
+formation_radius: 0.5
+
+# Spawn box (centered on the origin).
+spawn_radius: 0.4
+
+# Cluster spawn (so agents start disordered, not pre-arranged).
+spawn_cluster_center_x: 0.0
+spawn_cluster_center_y: 0.0
+spawn_cluster_radius: 0.25
+
+# Obstacles (Phase 2). 0 = no obstacles.
+n_obstacles: 0
+obstacle_radius: 0.10
+
+# Agent geometry.
+agent_radius: 0.05
+
+# Dynamic-target mode (Phase 3): the formation translates over the episode.
+moving_target: False
+target_speed: 0.0

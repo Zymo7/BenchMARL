@@ -1,0 +1,18 @@
+defaults:
+  - _self_
+
+# Backward-compat alias for the formation task. Same shape as the
+# benchmarl_hgn_formation task; VmasTask.FORMATION resolves to this file.
+max_steps: 200
+n_agents: 6
+formation_type: circle
+formation_radius: 0.5
+spawn_radius: 0.4
+spawn_cluster_center_x: 0.0
+spawn_cluster_center_y: 0.0
+spawn_cluster_radius: 0.25
+n_obstacles: 0
+obstacle_radius: 0.10
+agent_radius: 0.05
+moving_target: False
+target_speed: 0.0

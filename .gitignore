@@ -8,6 +8,10 @@
 outcmaes/*.dat
 outcmaes/*.json2
 
+# HGN / CMA-ES training run directories (regenerated per run)
+cmaeshan_*/
+cmaesgan_*/
+
 # Docs
 docs/output/
 docs/source/generated/
