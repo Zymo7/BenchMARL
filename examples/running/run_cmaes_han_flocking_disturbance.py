@@ -100,10 +100,11 @@ def parse_args():
     p.add_argument("--disturbance-step", type=int, default=800,
                    help="Step at which to apply the disturbance.")
     p.add_argument("--disturbance-mode", type=str, default="freeze",
-                   choices=["freeze", "push"],
+                   choices=["freeze", "push", "none"],
                    help="Disturbance variant: 'freeze' = zero action + "
                         "anchor pos/vel; 'push' = one-shot velocity "
-                        "impulse (no anchoring).")
+                        "impulse (no anchoring); 'none' = no disturbance "
+                        "(control condition).")
     p.add_argument("--frozen-agent-idx", type=int, default=2,
                    help="Index of the agent to disturb (freeze or push) at "
                         "the disturbance step.")
@@ -131,6 +132,21 @@ def parse_args():
                         "places the target at the bottom edge of the "
                         "world and biases the flocking orbit "
                         "asymmetrically. Setting to 0.0 centers it.")
+    p.add_argument("--target-motion", type=str, default="stationary",
+                   choices=["stationary", "circle", "figure8",
+                            "random_walk", "evader"],
+                   help="Target trajectory. Used together with "
+                        "--disturbance to study how HAN adapts when the "
+                        "target is moving (default stationary).")
+    p.add_argument("--target-motion-radius", type=float, default=0.35)
+    p.add_argument("--target-motion-period", type=int, default=400)
+    p.add_argument("--target-motion-speed", type=float, default=0.01)
+    p.add_argument("--target-motion-interval", type=int, default=50)
+    p.add_argument("--target-motion-bound", type=float, default=0.9,
+                   help="Half-extent of the box the evader bounces inside.")
+    p.add_argument("--target-motion-match-speed", action="store_true",
+                   help="Rescale the figure-8 period so its mean speed "
+                        "matches the circle mode at the same radius.")
     return p.parse_args()
 
 
@@ -141,6 +157,13 @@ _flocking_patch_configure(
     target_pos_x=args.target_pos_x,
     target_pos_y=args.target_pos_y,
     neighbor_radius=args.neighbor_radius,
+    target_motion=args.target_motion,
+    target_motion_radius=args.target_motion_radius,
+    target_motion_period=args.target_motion_period,
+    target_motion_speed=args.target_motion_speed,
+    target_motion_interval=args.target_motion_interval,
+    target_motion_bound=args.target_motion_bound,
+    target_motion_match_speed=args.target_motion_match_speed,
 )
 
 
@@ -207,12 +230,23 @@ def _load_trained_model(experiment, exp_path, device):
     )
 
     han_model = experiment.algorithm.get_han_model()
-    abcd_path = han_dir / "abcd_params.npy"
-    if abcd_path.exists():
-        abcd = np.load(str(abcd_path))
-        han_model.set_abcd_from_vector(torch.tensor(abcd, device=device))
-        han_model.reset_all_weights()
-        print(f"Loaded ABCD params: {len(abcd)} parameters")
+    # A static-mode experiment optimized W (w_params.npy); a plastic
+    # experiment optimized ABCD (abcd_params.npy).
+    if metadata.get("static_mode", False):
+        w_path = han_dir / "w_params.npy"
+        if w_path.exists():
+            w = np.load(str(w_path))
+            han_model.set_w_from_vector(torch.tensor(w, device=device))
+            han_model.freeze_weights = True
+            print(f"Loaded static W params: {len(w)} parameters "
+                  f"(Hebbian rule disabled)")
+    else:
+        abcd_path = han_dir / "abcd_params.npy"
+        if abcd_path.exists():
+            abcd = np.load(str(abcd_path))
+            han_model.set_abcd_from_vector(torch.tensor(abcd, device=device))
+            han_model.reset_all_weights()
+            print(f"Loaded ABCD params: {len(abcd)} parameters")
     return han_model, metadata
 
 
@@ -232,6 +266,7 @@ def _build_optimizer(experiment, han_model, device):
         orbit_radius=args.orbit_radius,
         orbit_radius_tolerance=args.orbit_radius_tolerance,
         dt_floor=args.dt_floor,
+        static_mode=bool(han_model.freeze_weights),
     )
 
 
@@ -666,14 +701,38 @@ def print_phase_summary(metrics, pos_history, target_pos_history,
     print(f"  Full post       [{disturbance_step}..{T}):     "
           f"Fg={stat(Fg, full_post)[0]:.3f}±{stat(Fg, full_post)[1]:.3f}")
     if not math.isnan(stat(Fg, pre)[0]):
-        drop = stat(Fg, pre)[0] - stat(Fg, full_post)[0]
-        print(f"\n  Fitness drop after disturbance: {drop:+.3f}")
+        # Reference level = LOCAL pre-disturbance steady state (last 100
+        # steps). The whole pre-window includes the warm-up phase where Fg
+        # is still climbing, so using its mean would make "recovery"
+        # meaningless.
+        local = slice(max(0, disturbance_step - 100), disturbance_step)
+        local_mean = stat(Fg, local)[0]
+        drop = local_mean - Fg[disturbance_step:].min()
+        print(f"\n  Fitness drop after disturbance: {drop:+.3f} "
+              f"(min post {Fg[disturbance_step:].min():.3f} vs local pre "
+              f"{local_mean:.3f})")
         if drop < 0.1:
-            print("  → HAN is ROBUST to the disturbance (fitness barely changed).")
+            print("  → ROBUST to the disturbance (fitness barely changed).")
         elif drop < 0.4:
-            print("  → HAN shows partial adaptation (some drop, partial recovery).")
+            print("  → Partial adaptation (some drop, partial recovery).")
         else:
-            print("  → HAN does NOT adapt well to the disturbance.")
+            print("  → Does NOT adapt well to the disturbance.")
+
+        # Recovery time: how many steps until Fg returns to within 5% of
+        # the local pre-disturbance level?
+        band = 0.05 * abs(local_mean) if local_mean else 1e-6
+        post = Fg[disturbance_step:]
+        recovered = None
+        for i, v in enumerate(post):
+            if abs(v - local_mean) <= band:
+                recovered = i
+                break
+        if recovered is None:
+            print(f"  Recovery time: never returned to within 5% of the "
+                  f"local pre-disturbance level ({local_mean:.3f})")
+        else:
+            print(f"  Recovery time: {recovered} steps to return to within "
+                  f"5% of local pre-disturbance level ({local_mean:.3f})")
     print("=" * 70)
 
 
@@ -708,6 +767,15 @@ if __name__ == "__main__":
     print()
 
     task = _get_task()
+    # A static-mode experiment was trained with the Hebbian rule off; the
+    # model must be rebuilt with lr_hebb = 0 so the control stays static
+    # at eval time too.
+    with open(Path(exp_path) / "han_results" / "results.json") as f:
+        _meta = json.load(f)
+    if _meta.get("static_mode", False) and args.lr_hebb != 0.0:
+        print(f"NOTE: loaded experiment is static_mode; forcing "
+              f"--lr-hebb 0 (was {args.lr_hebb}).")
+        args.lr_hebb = 0.0
     model_config = _create_model_config()
     critic_model_config = _create_critic_model_config()
 

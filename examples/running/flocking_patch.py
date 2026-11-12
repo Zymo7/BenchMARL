@@ -4,7 +4,24 @@ Ensures training (run_cmaes_han_flocking_custom.py) and evaluation
 (run_cmaes_han_flocking_disturbance.py) see identical observations.
 
 Patches applied to ``vmas.scenarios.flocking.Scenario``:
-  1. ``action_script_creator`` → target stays stationary.
+  1. ``action_script_creator`` → target motion is configurable via
+     ``configure(target_motion=...)``:
+       - ``"stationary"`` (default): target frozen at (x, y) — the
+         original behavior of this patch.
+       - ``"circle"``: target orbits (x, y) at ``target_motion_radius``
+         with ``target_motion_period`` steps per revolution.
+       - ``"figure8"``: Gerono lemniscate through (x, y), extents
+         (±R, ±R/2), same period.
+       - ``"random_walk"``: constant speed ``target_motion_speed``,
+         heading resampled every ``target_motion_interval`` steps and
+         on wall hits (clamped to ±0.95).
+     Motion is *kinematic*: the script sets ``u = 0`` (VMAS asserts an
+     action script sets ``u``) and drives the position analytically via
+     ``set_pos`` — the same mechanism as ``vmas flocking_signal``. A
+     force-driven orbit (tangential ``u`` + drag) produces a lagging
+     rosette rather than a circle, so analytic positions are the right
+     tool. Phase/heading state lives on the scenario and is reset per
+     episode in ``reset_world_at`` for reproducible eval trajectories.
   2. ``reset_world_at`` → target initialized at ``(target_pos_x, target_pos_y)``
      instead of the VMAS default ``(0, -y_dim)``.
   3. ``observation`` → 10-dim:
@@ -29,6 +46,8 @@ Only ``name == "flocking.py" or name == "flocking"`` is patched; all
 other VMAS scenarios are untouched.
 """
 import importlib
+import math
+
 import torch
 import vmas  # noqa: F401 — triggers vmas.__init__, vmas.scenarios = list
 from vmas.simulator.core import Agent, World, Landmark
@@ -48,6 +67,33 @@ _DT_FLOOR = 0.1
 _ORBIT_REWARD_WEIGHT_AT = 0.0  # off by default → identical to vanilla
 _ORBIT_REWARD_WEIGHT_DT = 0.0  # off by default → identical to vanilla
 _SPEED_THRESHOLD = 0.02  # At is gated by speed > threshold
+# Moving-target motion (kinematic, see module docstring §1).
+_TARGET_MOTION = "stationary"
+_TARGET_MOTION_RADIUS = 0.35
+_TARGET_MOTION_PERIOD = 400
+_TARGET_MOTION_SPEED = 0.01
+_TARGET_MOTION_INTERVAL = 50
+# "evader" mode: fast target (speed comparable to the agents' own ~0.37
+# units/step) that bounces off the walls of the ±_TARGET_MOTION_BOUND box.
+_TARGET_MOTION_BOUND = 0.9
+# Speed-matching factor between the figure-8 and the circle.
+#
+# For the Gerono lemniscate  x = R·sin φ,  y = (R/2)·sin 2φ  with
+# φ = 2πt/T, the instantaneous speed is
+#     (2πR/T)·sqrt(cos²φ + cos²2φ)
+# whose mean over one period is 0.9700·(2πR/T) — i.e. the figure-8
+# covers slightly LESS distance per revolution than a circle of the same
+# radius. So to give both trajectories the same mean speed at the same
+# radius, the figure-8 needs a slightly SHORTER period:
+#     T_figure8 = 0.9700 · T_circle
+# Measured: R=0.35 → circle T=400 gives 0.005498/step,
+#                     figure-8 T=388 gives 0.005499/step (0.02% error).
+_FIGURE8_SPEED_FACTOR = 0.97
+# Per-batch-env motion state, lazily created by the action script and
+# reset per episode by ``_patched_reset_world_at`` (env_index=None only —
+# partial resets keep their state, matching how the trainable agents'
+# ``self.t`` behaves).
+_TARGET_MOTION_STATE = {}
 
 
 def configure(
@@ -59,6 +105,13 @@ def configure(
     dt_floor=0.1,
     orbit_reward_weight_at=0.0,
     orbit_reward_weight_dt=0.0,
+    target_motion="stationary",
+    target_motion_radius=0.35,
+    target_motion_period=400,
+    target_motion_speed=0.01,
+    target_motion_interval=50,
+    target_motion_bound=0.9,
+    target_motion_match_speed=False,
 ):
     """Set the parameters read by the patched methods.
 
@@ -66,10 +119,28 @@ def configure(
     backward-compatible with the original VMAS flocking reward
     (collision + distance shaping only). Set them > 0 to add
     tangential-alignment (At) and distance-band (Dt) shaping on top.
+
+    ``target_motion`` selects the target trajectory:
+      ``"stationary"`` | ``"circle"`` | ``"figure8"`` | ``"random_walk"``
+      | ``"evader"``.
+    ``circle``/``figure8`` use (``target_motion_radius``,
+    ``target_motion_period``); ``random_walk`` uses
+    (``target_motion_speed``, ``target_motion_interval``);
+    ``evader`` uses (``target_motion_speed``, ``target_motion_interval``,
+    ``target_motion_bound``).
+
+    ``target_motion_match_speed=True`` rescales the period of the
+    ``figure8`` mode so that its mean speed matches the ``circle`` mode
+    at the same radius (see ``_FIGURE8_SPEED_FACTOR``). This makes the
+    two trajectories directly comparable in terms of how fast the target
+    moves.
     """
     global _TARGET_POS_X, _TARGET_POS_Y, _NEIGHBOR_RADIUS
     global _ORBIT_RADIUS, _ORBIT_RADIUS_TOLERANCE, _DT_FLOOR
     global _ORBIT_REWARD_WEIGHT_AT, _ORBIT_REWARD_WEIGHT_DT
+    global _TARGET_MOTION, _TARGET_MOTION_RADIUS, _TARGET_MOTION_PERIOD
+    global _TARGET_MOTION_SPEED, _TARGET_MOTION_INTERVAL
+    global _TARGET_MOTION_BOUND
     _TARGET_POS_X = float(target_pos_x)
     _TARGET_POS_Y = float(target_pos_y)
     _NEIGHBOR_RADIUS = float(neighbor_radius)
@@ -78,10 +149,28 @@ def configure(
     _DT_FLOOR = float(dt_floor)
     _ORBIT_REWARD_WEIGHT_AT = float(orbit_reward_weight_at)
     _ORBIT_REWARD_WEIGHT_DT = float(orbit_reward_weight_dt)
+    valid_motions = (
+        "stationary", "circle", "figure8", "random_walk", "evader",
+    )
+    if target_motion not in valid_motions:
+        raise ValueError(
+            f"target_motion must be one of {valid_motions}, "
+            f"got {target_motion!r}"
+        )
+    _TARGET_MOTION = target_motion
+    _TARGET_MOTION_RADIUS = float(target_motion_radius)
+    period = max(int(target_motion_period), 1)
+    if target_motion == "figure8" and target_motion_match_speed:
+        # Match the circle's mean speed at the same radius.
+        period = max(int(round(period * _FIGURE8_SPEED_FACTOR)), 1)
+    _TARGET_MOTION_PERIOD = period
+    _TARGET_MOTION_SPEED = float(target_motion_speed)
+    _TARGET_MOTION_INTERVAL = max(int(target_motion_interval), 1)
+    _TARGET_MOTION_BOUND = float(target_motion_bound)
 
 
 # ---------------------------------------------------------------------------
-# 1) Stationary target action script.
+# 1) Target motion action scripts.
 # ---------------------------------------------------------------------------
 def _stationary_action_script(agent, world, scenario_self):
     """Stationary target: u = 0 for all envs."""
@@ -90,9 +179,199 @@ def _stationary_action_script(agent, world, scenario_self):
     agent.action.u = torch.zeros((batch_dim, 2), device=device)
 
 
+def _zeros_u(agent):
+    agent.action.u = torch.zeros(
+        (agent.batch_dim, 2), device=agent.device
+    )
+
+
+def _motion_position(mode, step, B, device, dtype):
+    """Analytic target position at phase ``step`` for every batch env.
+
+    Returns a (B, 2) tensor of positions relative to
+    (_TARGET_POS_X, _TARGET_POS_Y). All trajectories stay inside the
+    ±0.5 default-radius orbits, well within the ±1.0 world bounds.
+    """
+    base = torch.zeros((B, 2), device=device, dtype=dtype)
+    if mode == "circle":
+        phi = 2.0 * math.pi * step.to(dtype) / _TARGET_MOTION_PERIOD
+        base[:, 0] = _TARGET_MOTION_RADIUS * torch.cos(phi)
+        base[:, 1] = _TARGET_MOTION_RADIUS * torch.sin(phi)
+    elif mode == "figure8":
+        # Gerono lemniscate: x = R sin(phi), y = (R/2) sin(2 phi).
+        phi = 2.0 * math.pi * step.to(dtype) / _TARGET_MOTION_PERIOD
+        base[:, 0] = _TARGET_MOTION_RADIUS * torch.sin(phi)
+        base[:, 1] = (
+            0.5 * _TARGET_MOTION_RADIUS * torch.sin(2.0 * phi)
+        )
+    # "random_walk" integrates heading on the scenario; handled by
+    # _random_walk_position, not here.
+    return base
+
+
+def _random_walk_position(B, device, dtype):
+    """Advance (or initialize) the random-walk state and return (B, 2)
+    absolute positions.
+
+    State lives in the module-level ``_TARGET_MOTION_STATE`` dict keyed
+    by batch-env index, created lazily here and cleared per episode in
+    ``_patched_reset_world_at``. Heading resamples every
+    ``_TARGET_MOTION_INTERVAL`` steps or when the next position would
+    leave the ±0.95 box (choose a direction pointing back inside).
+    """
+    pos0 = torch.tensor(
+        [_TARGET_POS_X, _TARGET_POS_Y], device=device, dtype=dtype
+    )
+    positions = pos0.repeat(B, 1)
+    for b in range(B):
+        st = _TARGET_MOTION_STATE.get(b)
+        if st is None:
+            st = {
+                "pos": pos0.clone(),
+                "theta": 2.0 * math.pi * torch.rand(1).item(),
+                "steps": 0,
+            }
+            _TARGET_MOTION_STATE[b] = st
+        # Resample heading periodically.
+        st["steps"] += 1
+        if st["steps"] >= _TARGET_MOTION_INTERVAL:
+            st["theta"] = 2.0 * math.pi * torch.rand(1).item()
+            st["steps"] = 0
+        nxt = st["pos"] + _TARGET_MOTION_SPEED * torch.tensor(
+            [math.cos(st["theta"]), math.sin(st["theta"])],
+            device=device, dtype=dtype,
+        )
+        # Wall hit: head back toward the configured center.
+        if (nxt[0].abs() > 0.95) or (nxt[1].abs() > 0.95):
+            st["theta"] = math.atan2(
+                (pos0 - st["pos"])[1].item(),
+                (pos0 - st["pos"])[0].item(),
+            )
+            st["steps"] = 0
+            nxt = st["pos"] + _TARGET_MOTION_SPEED * torch.tensor(
+                [math.cos(st["theta"]), math.sin(st["theta"])],
+                device=device, dtype=dtype,
+            )
+        st["pos"] = nxt
+        positions[b] = nxt
+    return positions
+
+
+def _evader_position(B, device, dtype):
+    """Fast random-walking target that bounces off the world walls.
+
+    This is the "pursuit / encirclement" motion: the target moves at
+    ``_TARGET_MOTION_SPEED`` (comparable to the agents' own speed, ~0.37
+    units/step) with its heading resampled every
+    ``_TARGET_MOTION_INTERVAL`` steps, and reflects off the walls of the
+    ±``_TARGET_MOTION_BOUND`` box.
+
+    Unlike ``circle``/``figure8`` (whose speed is only ~1.5% of the
+    agents' speed, so the target looks stationary to a policy), the
+    evader is genuinely hard to track — the swarm has to re-aim
+    continuously.
+
+    State lives in the module-level ``_TARGET_MOTION_STATE`` dict keyed
+    by batch-env index, created lazily here and cleared per episode in
+    ``_patched_reset_world_at``.
+    """
+    bound = _TARGET_MOTION_BOUND
+    speed = _TARGET_MOTION_SPEED
+    positions = torch.zeros((B, 2), device=device, dtype=dtype)
+    for b in range(B):
+        st = _TARGET_MOTION_STATE.get(b)
+        if st is None:
+            st = {
+                "pos": torch.tensor(
+                    [_TARGET_POS_X, _TARGET_POS_Y], device=device, dtype=dtype
+                ),
+                "theta": 2.0 * math.pi * torch.rand(1).item(),
+                "steps": 0,
+            }
+            _TARGET_MOTION_STATE[b] = st
+
+        # Resample heading periodically -> unpredictable direction.
+        st["steps"] += 1
+        if st["steps"] >= _TARGET_MOTION_INTERVAL:
+            st["theta"] = 2.0 * math.pi * torch.rand(1).item()
+            st["steps"] = 0
+
+        pos = st["pos"]
+        theta = st["theta"]
+        # Reflect off the walls (at most one reflection per axis).
+        for _ in range(2):
+            nxt = pos + speed * torch.tensor(
+                [math.cos(theta), math.sin(theta)], device=device, dtype=dtype
+            )
+            hit_x = bool(nxt[0].abs() > bound)
+            hit_y = bool(nxt[1].abs() > bound)
+            if not (hit_x or hit_y):
+                break
+            if hit_x:
+                theta = math.pi - theta
+            if hit_y:
+                theta = -theta
+            st["theta"] = theta
+        nxt = pos + speed * torch.tensor(
+            [math.cos(theta), math.sin(theta)], device=device, dtype=dtype
+        )
+        nxt[0] = torch.clamp(nxt[0], -bound, bound)
+        nxt[1] = torch.clamp(nxt[1], -bound, bound)
+        st["pos"] = nxt
+        positions[b] = nxt
+    return positions
+
+
+def _moving_action_script(agent, world, scenario_self):
+    """Kinematic moving target: u = 0, position set analytically.
+
+    VMAS asserts that an action script sets ``u`` (core.py
+    ``action_callback``), so we keep the force at zero and drive
+    ``state.pos`` directly — the same mechanism as the ``flocking_signal``
+    scenario's ``pre_step``. ``action_callback`` runs inside
+    ``env_process_action`` *before* ``world.step()``, and with u = 0 and
+    zero drag-displaced velocity the physics step leaves the position
+    where we set it.
+    """
+    _zeros_u(agent)
+    mode = _TARGET_MOTION
+    if mode == "stationary":
+        return
+    B = agent.batch_dim
+    state = scenario_self._target.state
+    if mode == "random_walk":
+        new_pos = _random_walk_position(
+            B, agent.device, state.pos.dtype
+        )
+        agent.set_pos(new_pos, batch_index=None)
+        return
+    if mode == "evader":
+        new_pos = _evader_position(B, agent.device, state.pos.dtype)
+        agent.set_pos(new_pos, batch_index=None)
+        return
+    # circle / figure8: closed-form trajectory from the per-env phase.
+    step = getattr(scenario_self, "_target_motion_step", None)
+    if step is None:
+        step = torch.zeros(B, device=agent.device, dtype=torch.long)
+        scenario_self._target_motion_step = step
+    step += 1
+    rel = _motion_position(mode, step, B, agent.device, state.pos.dtype)
+    center = torch.stack(
+        [
+            torch.full((B,), _TARGET_POS_X, device=agent.device),
+            torch.full((B,), _TARGET_POS_Y, device=agent.device),
+        ],
+        dim=-1,
+    ).to(state.pos.dtype)
+    agent.set_pos(center + rel, batch_index=None)
+
+
 def _patched_action_script_creator(self):
     def action_script(agent, world):
-        _stationary_action_script(agent, world, self)
+        if _TARGET_MOTION == "stationary":
+            _stationary_action_script(agent, world, self)
+        else:
+            _moving_action_script(agent, world, self)
     return action_script
 
 
@@ -185,6 +464,11 @@ def _patched_reset_world_at(self, env_index=None):
     target_pos[:, X] = _TARGET_POS_X
     target_pos[:, Y] = _TARGET_POS_Y
     self._target.set_pos(target_pos, batch_index=env_index)
+    if env_index is None:
+        # Reset moving-target motion state so each episode starts from
+        # the same trajectory phase (reproducible eval rollouts).
+        self._target_motion_step = None
+        _TARGET_MOTION_STATE.clear()
     ScenarioUtils.spawn_entities_randomly(
         self.obstacles + self.world.policy_agents,
         self.world,

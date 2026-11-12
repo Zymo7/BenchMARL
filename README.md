@@ -224,84 +224,6 @@ Each mode writes its own sub-folder (`disturbance_eval_freeze/`,
 - `per_step_data.npz` — raw `At, Dt, Cg, S` time series for offline
   analysis.
 
-### 1.6 Head-to-head metrics (HAN vs static-MLP)
-
-Because raw `F_orbit` numbers reward whatever a policy was optimized
-for, we added a more interpretable **comparison** suite
-(`examples/running/run_comparison_eval.py`,
-`examples/running/plot_comparison.py`,
-`examples/run_eval.py`) that re-scores all candidates on the same
-freshly-rolled-out episodes. The metrics are:
-
-| Metric            | Definition |
-|-------------------|------------|
-| `T_stable`        | First time index at which the formation sustained the geometric stability rule for `stable_window = 20` consecutive steps. |
-| `stable_quality`  | Composite in-window score: `0.4·radius + 0.3·angle + 0.2·direction + 0.1·eccentricity`. |
-| `T_recover`       | After the disturbance step, time to next sustained-stability window **on the same remaining agents** (`n_keep ≥ 2`). Set to "never" if no recovery. |
-| `error_vs_N`      | Same `stable_quality` averaged across `n_agents ∈ {4, 6, 8, 10, 12}` (a transfer test of the policy trained at `N=4`). |
-
-"Never stable" and "never recovered" episodes are drawn as **hatched**
-bars, so missing bars are explicit rather than zero-baselined.
-
-#### Run the comparison
-
-```bash
-# 1. Run all (N, mode) combinations
-python examples/run_eval.py \
-    --han-experiments outputs/cmaeshan_flocking_hanmodel__*/ \
-    --static-mlp-experiments outputs/cmaesstaticmlp_flocking_staticmlpmodel__*/ \
-    --n-agents 4,6,8,10,12 \
-    --disturbance-modes freeze push \
-    --scenarios frozen_agent --max-steps 500
-
-# 2. Aggregate + plot
-python examples/running/plot_comparison.py --output-dir plots/
-```
-
-The output (under `plots/`):
-
-- `t_stable.png`, `t_recover.png` — bar charts with hatched bars for
-  never-stable / never-recovered.
-- `f_quality.png` — `stable_quality` over (N, algo).
-- `error_vs_N.png` — quality across N (transfer-robustness).
-
-#### Probe a single disturbance episode with video
-
-```bash
-python examples/running/run_cmaes_han_flocking_disturbance.py \
-    --experiment-path outputs/cmaeshan_flocking_hanmodel__<id> \
-    --fitness-mode flocking_orbit \
-    --disturbance-mode push \
-    --disturbance-step 200 --frozen-agent-idx 2 \
-    --push-magnitude 0.5 --push-direction radial-out \
-    --max-steps 300
-```
-
-The same script exists for the static-MLP baseline
-(`run_cmaes_static_mlp_flocking_disturbance.py`).
-
-### 1.7 Heads-up: what the data currently shows
-
-The disturbance harness and the four metrics above were the user's
-explicit answer to *"the original comparison just showed HAN is worse
-than static-MLP"*. With the new metrics, we now report the actual
-behaviour honestly:
-
-- On `T_stable` and transfer to larger `N`, the static-MLP baseline
-  matches or beats HAN. We could not confirm the hypothesis "HAN is
-  more N-robust than static-MLP".
-- On **push** disturbance, both networks are surprisingly robust
-  (`F_orbit` drop ≤ ~0.1 at `push_magnitude = 0.5`). HAN's online
-  plasticity does not yet translate into a clearly faster
-  `T_recover`.
-- On **freeze**, the gap is real: `Cg` (cohesion) collapses once a
-  neighbour is held in place. HAN's incremental rule partially
-  compensates, but neither policy recovers to the
-  pre-disturbance `At · Dt · S` triple.
-
-This repository is honest about negative results — see
-`HAN_flocking.md` and the in-tree session notes for the full numbers.
-
 ---
 
 ## 2. IPPO + Hebbian: gradient-trained, plastic at deployment
@@ -410,17 +332,6 @@ plugging in a user-defined fitness function while reusing the rest of
 the HAN / CMA-ES scaffolding. They were used to develop the four
 geometric metrics in §1.6 and to build the wind-perturbed variants.
 
-### 3.5 `wind_flocking` (periodic environmental forcing)
-
-A separate VMAS scenario lives at
-`benchmarl/environments/vmas/wind_flocking.py` and its YAML config in
-`benchmarl/conf/task/vmas/wind_flocking.yaml`. It applies a small
-sinusoidal wind force to the flock and lets us test whether HAN's
-online Hebbian updates can ride out periodic non-stationarity (a
-lighter-weight version of §2). Currently only the static-MLP baseline
-has been run on it — adding HAN is a TODO in `HAN_flocking.md`.
-
----
 
 ## 4. Installation
 
@@ -502,26 +413,9 @@ python examples/running/run_cmaes_han_simple_tag_v1.py \
     --num-good-agents 1 --num-adversaries 3 \
     --cmaes-gens 30 --pop-size 20 --n-eval-episodes 2
 ```
-
 ---
 
-## 6. Contributing
-
-This is a **research scratchpad**, not a stable product. Issues,
-pull-requests and experiments that contradict our conclusions are all
-welcome — please include:
-
-- the commit hash you ran on,
-- the exact CLI invocation,
-- the resulting `summary.json` (for the comparison suite) or the
-  resulting `han_results/results.json` (for a training run).
-
-The biggest known TODOs are listed at the top of `CODEBASE_GUIDE.md`
-and again in the "Status:" line of each experiment above.
-
----
-
-## 7. Citation
+## 6. Citation
 
 If you use this codebase in academic work, please cite the upstream
 BenchMARL paper:
@@ -542,7 +436,7 @@ BenchMARL paper:
 For work specifically on **HAN** (Hebbian Attractor Network), please
 cite our forthcoming write-up — placeholder until the preprint lands.
 
-## 8. License
+## 7. License
 
 MIT — see [LICENSE](LICENSE). The HAN / static-MLP / IPPO-Hebbian
 code in this repository is original to this fork; everything in

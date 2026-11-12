@@ -268,6 +268,14 @@ class HanModel(Model):
         else:
             self._update_interval = self.f_nn // self.f_hebb
 
+        # When True, the Hebbian update is skipped entirely — W stays
+        # exactly as set. Used by the static-network control: with
+        # ``lr_hebb == 0`` the update ``W + 0*delta_W`` is inert, but the
+        # hard max-abs normalization would still rescale W every
+        # interval, which would corrupt a CMA-ES candidate that CMA-ES
+        # wrote directly into W.
+        self.freeze_weights: bool = False
+
     def _perform_checks(self):
         super()._perform_checks()
 
@@ -315,6 +323,8 @@ class HanModel(Model):
 
         W is strictly static between updates: forward() never mutates W.
         """
+        if self.freeze_weights:
+            return
         if self._update_interval is None:
             return
         if self.ticks % self._update_interval != 0:
@@ -361,6 +371,42 @@ class HanModel(Model):
             n = layer.num_abcd_params
             layer.set_abcd_from_vector(vector[offset:offset + n])
             offset += n
+
+    # ------------------------------------------------------------------ #
+    # Direct access to the plastic weight matrices W.
+    #
+    # Used by the CMA-ES "static mode" control: when ``lr_hebb == 0`` the
+    # Hebbian rule is inert (ABCD never influences anything), so optimizing
+    # ABCD would be optimizing a no-op. The static control instead lets
+    # CMA-ES optimize W directly, producing a *trained* static feedforward
+    # network as the correct baseline for "what does plasticity buy?".
+    # ------------------------------------------------------------------ #
+    def get_w_vector(self) -> torch.Tensor:
+        """Flatten the plastic weight matrices ``W`` of all layers.
+
+        Mirrors :meth:`get_abcd_vector` but for W (140 dims for the
+        10->10->4 flocking HAN, vs 560 for ABCD).
+        """
+        return torch.cat([
+            layer.W.data.flatten() for layer in self.get_all_han_layers()
+        ])
+
+    def set_w_from_vector(self, vector: torch.Tensor):
+        """Write a flat vector into each layer's ``W`` **and** ``W_init``.
+
+        ``W_init`` is synced deliberately: :meth:`reset_all_weights`
+        restores ``W`` from ``W_init``, and ``W_init`` holds the random
+        initialization. Re-syncing it makes that reset a no-op for the
+        candidate instead of randomizing the network between episodes.
+        """
+        offset = 0
+        with torch.no_grad():
+            for layer in self.get_all_han_layers():
+                n = layer.W.numel()
+                chunk = vector[offset:offset + n].reshape(layer.W.shape)
+                layer.W.data.copy_(chunk)
+                layer.W_init.copy_(chunk)
+                offset += n
 
     def reset_all_weights(self):
         """Reset plastic weights in all layers to initial values, and clear

@@ -55,6 +55,17 @@ def parse_args():
     parser.add_argument("--formation-collision-penalty", type=float, default=2.0)
     parser.add_argument("--formation-timeout-penalty", type=float, default=2.0)
     parser.add_argument("--formation-reach-radius", type=float, default=0.10)
+    # hgn_formation_v2 (whole-episode collision avoidance)
+    parser.add_argument("--formation-safety-distance", type=float, default=0.12,
+                        help="Two agents within this distance count as a "
+                             "collision. Default 0.12 = 2 * agent_radius (0.05) "
+                             "+ 0.02 margin.")
+    parser.add_argument("--formation-collision-intensity-weight", type=float,
+                        default=4.0,
+                        help="Per-step continuous penalty: collision_intensity_weight "
+                             "* (steps_with_collision / total_steps). Encourages "
+                             "CMA-ES to minimise collision *frequency*, not just "
+                             "final-step collision.")
 
     # CMA-ES parameters
     parser.add_argument("--cmaes-gens", type=int, default=15)
@@ -236,6 +247,8 @@ def main():
         formation_collision_penalty=args.formation_collision_penalty,
         formation_timeout_penalty=args.formation_timeout_penalty,
         formation_reach_radius=args.formation_reach_radius,
+        formation_safety_distance=args.formation_safety_distance,
+        formation_collision_intensity_weight=args.formation_collision_intensity_weight,
         # Compatibility kwargs (unused for formation fitness)
         collision_penalty_weight=args.collision_penalty_weight,
         safety_distance=args.safety_distance,

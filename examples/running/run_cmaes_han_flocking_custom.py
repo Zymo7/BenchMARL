@@ -82,6 +82,16 @@ def parse_args():
                              "the 10-dim flocking observation "
                              "(pos+vel+target_rel+nn_rel_pos+nn_rel_vel).")
     parser.add_argument("--lr-hebb", type=float, default=0.01)
+    parser.add_argument("--static-mode", action="store_true",
+                        help="Train a STATIC network control: CMA-ES "
+                             "optimizes the plastic weight matrices W "
+                             "directly (140 dims) instead of the ABCD "
+                             "Hebbian parameters (560 dims), and the "
+                             "Hebbian rule is switched off entirely "
+                             "(lr_hebb forced to 0). This is the correct "
+                             "baseline for 'what does plasticity buy?' — "
+                             "unlike a bare --lr-hebb 0 eval, the network "
+                             "here is trained, not random.")
     parser.add_argument("--weight-init", type=float, default=0.1)
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--f-nn", type=int, default=4)
@@ -101,6 +111,53 @@ def parse_args():
                              "the target at the bottom edge and biases "
                              "the orbit asymmetrically. Set to 0.0 to "
                              "center the target in the world.")
+    parser.add_argument("--target-motion", type=str, default="stationary",
+                        choices=["stationary", "circle", "figure8",
+                                 "random_walk", "evader"],
+                        help="Target trajectory. stationary = fixed at "
+                             "(--target-pos-x, --target-pos-y) (training "
+                             "default); circle/figure8 orbit the center "
+                             "with radius --target-motion-radius and "
+                             "--target-motion-period steps per revolution; "
+                             "random_walk moves at --target-motion-speed "
+                             "with heading resampled every "
+                             "--target-motion-interval steps. Motion is "
+                             "kinematic (set_pos), matching flocking_signal.")
+    parser.add_argument("--target-motion-radius", type=float, default=0.35,
+                        help="Orbit radius for circle/figure8 target "
+                             "motion. 0.35 keeps the target within ±0.35 "
+                             "of center (trainable orbit_radius is 0.7).")
+    parser.add_argument("--target-motion-period", type=int, default=400,
+                        help="Steps per revolution for circle/figure8. "
+                             "Smaller = faster target = harder adaptation.")
+    parser.add_argument("--target-motion-speed", type=float, default=0.01,
+                        help="Speed per step for random_walk target motion.")
+    parser.add_argument("--target-motion-interval", type=int, default=50,
+                        help="Steps between heading resamples for "
+                             "random_walk / evader target motion.")
+    parser.add_argument("--target-motion-bound", type=float, default=0.9,
+                        help="Half-extent of the box the evader bounces "
+                             "inside (evader mode only).")
+    parser.add_argument("--target-motion-match-speed", action="store_true",
+                        help="Rescale the figure-8 period so its mean "
+                             "speed matches the circle mode at the same "
+                             "radius (T_figure8 = 0.97 * T_circle).")
+    parser.add_argument("--eval-output-subdir", type=str, default=None,
+                        help="Optional subdirectory (relative to the "
+                             "experiment path) for evaluate() outputs "
+                             "(videos). Use e.g. moving_target_eval to "
+                             "avoid overwriting the stationary baseline "
+                             "videos stored in videos_han/.")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Override the task's max_steps. The task yaml "
+                             "currently ships 1600, but the reference "
+                             "plastic HAN (b140e5f5) was trained with "
+                             "max_steps=800 — pass 800 to reproduce that "
+                             "training setup exactly.")
+    parser.add_argument("--n-agents", type=int, default=None,
+                        help="Override the task's n_agents. The task yaml "
+                             "currently ships 8, but the reference plastic "
+                             "HAN was trained with n_agents=4.")
     return parser.parse_args()
 
 
@@ -109,10 +166,21 @@ args = parse_args()
 # Configure the shared flocking monkey-patches with CLI values. MUST
 # match what the disturbance-eval script configures so that the trained
 # observation layout (10-dim, nearest-neighbor pos+vel) is identical.
+# Note: orbit_radius / orbit_radius_tolerance / dt_floor are NOT passed
+# here — the patch's env-level reward shaping stays at its defaults
+# (harmless: the orbit reward weights are 0). The fitness-side values
+# are the ones passed to CmaesHanOptimizer below.
 _flocking_patch_configure(
     target_pos_x=args.target_pos_x,
     target_pos_y=args.target_pos_y,
     neighbor_radius=args.neighbor_radius,
+    target_motion=args.target_motion,
+    target_motion_radius=args.target_motion_radius,
+    target_motion_period=args.target_motion_period,
+    target_motion_speed=args.target_motion_speed,
+    target_motion_interval=args.target_motion_interval,
+    target_motion_bound=args.target_motion_bound,
+    target_motion_match_speed=args.target_motion_match_speed,
 )
 
 # Validate hidden-size matches the observation dim (10 for nn mode).
@@ -122,6 +190,13 @@ if args.hidden_size != _expected_obs_dim:
           f"expected {_expected_obs_dim} for the 10-dim nn observation. "
           f"Auto-correcting to {_expected_obs_dim}.")
     args.hidden_size = _expected_obs_dim
+
+# Static mode: the Hebbian rule must be off, otherwise W keeps drifting
+# and the "static" control is not static. Force lr_hebb = 0.
+if args.static_mode and args.lr_hebb != 0.0:
+    print(f"NOTE: --static-mode forces --lr-hebb 0 "
+          f"(was {args.lr_hebb}); plasticity would defeat the control.")
+    args.lr_hebb = 0.0
 
 
 def _get_task():
@@ -139,6 +214,10 @@ def _get_task():
         task.config["n_dynamic_obstacles"] = args.n_dynamic_obstacles
     if "n_obstacles" in task.config:
         task.config["n_obstacles"] = 0
+    if args.max_steps is not None:
+        task.config["max_steps"] = args.max_steps
+    if args.n_agents is not None:
+        task.config["n_agents"] = args.n_agents
     return task
 
 
@@ -191,9 +270,17 @@ if __name__ == "__main__":
     print("CMA-ES HAN — Flocking with CUSTOM target motion")
     print("=" * 60)
     print(f"Task: {args.task} | fitness_mode: {args.fitness_mode}")
-    print(f"Flocking patch: stationary target @ "
+    print(f"Flocking patch: target_motion={args.target_motion} @ "
           f"({args.target_pos_x}, {args.target_pos_y}), "
           f"neighbor_radius={args.neighbor_radius}, obs=10-dim (nn pos+vel)")
+    if args.target_motion in ("circle", "figure8"):
+        print(f"  motion radius={args.target_motion_radius}, "
+              f"period={args.target_motion_period} steps/rev "
+              f"(tangential speed ≈ "
+              f"{2 * 3.141592653 * args.target_motion_radius / args.target_motion_period:.4f}/step)")
+    elif args.target_motion == "random_walk":
+        print(f"  motion speed={args.target_motion_speed}/step, "
+              f"heading resample every {args.target_motion_interval} steps")
     print(f"orbit_radius={args.orbit_radius}, "
           f"orbit_radius_tolerance={args.orbit_radius_tolerance}, "
           f"dt_floor={args.dt_floor}")
@@ -209,6 +296,18 @@ if __name__ == "__main__":
         print(f"Loaded metadata: {metadata['n_layers']} layers, "
               f"fitness={metadata['best_fitness']}")
 
+        # A static-mode experiment optimized W (saved as w_params.npy);
+        # a plastic experiment optimized ABCD (abcd_params.npy).
+        # Detect it BEFORE building the experiment so the model is created
+        # with lr_hebb = 0 (the Hebbian rule must be inert for a static
+        # network, otherwise W drifts and the control is not static).
+        is_static = bool(metadata.get("static_mode", False))
+        if is_static and args.lr_hebb != 0.0:
+            print(f"NOTE: loaded experiment is static_mode; forcing "
+                  f"--lr-hebb 0 (was {args.lr_hebb}).")
+            args.lr_hebb = 0.0
+            model_config = _create_model_config()
+
         experiment = _setup_experiment_for_cmaes(
             task, model_config, critic_model_config, output_dir)
         policy_path = han_dir / "policy_state.pt"
@@ -216,12 +315,22 @@ if __name__ == "__main__":
             torch.load(str(policy_path),
                        map_location=experiment.config.train_device))
         han_model = experiment.algorithm.get_han_model()
-        abcd_path = han_dir / "abcd_params.npy"
-        if abcd_path.exists():
-            abcd = np.load(str(abcd_path))
-            han_model.set_abcd_from_vector(
-                torch.tensor(abcd, device=experiment.config.train_device))
-            han_model.reset_all_weights()
+        if is_static:
+            w_path = han_dir / "w_params.npy"
+            if w_path.exists():
+                w = np.load(str(w_path))
+                han_model.set_w_from_vector(
+                    torch.tensor(w, device=experiment.config.train_device))
+                han_model.freeze_weights = True
+                print(f"Loaded static W params: {len(w)} parameters "
+                      f"(Hebbian rule disabled)")
+        else:
+            abcd_path = han_dir / "abcd_params.npy"
+            if abcd_path.exists():
+                abcd = np.load(str(abcd_path))
+                han_model.set_abcd_from_vector(
+                    torch.tensor(abcd, device=experiment.config.train_device))
+                han_model.reset_all_weights()
 
         optimizer = CmaesHanOptimizer(
             experiment=experiment,
@@ -236,12 +345,28 @@ if __name__ == "__main__":
             orbit_radius=args.orbit_radius,
             orbit_radius_tolerance=args.orbit_radius_tolerance,
             dt_floor=args.dt_floor,
+            static_mode=is_static,
         )
-        if abcd_path.exists():
-            optimizer._best_abcd_so_far = np.load(str(abcd_path))
+        if is_static:
+            w_path = han_dir / "w_params.npy"
+            if w_path.exists():
+                optimizer._best_abcd_so_far = np.load(str(w_path))
+        else:
+            abcd_path = han_dir / "abcd_params.npy"
+            if abcd_path.exists():
+                optimizer._best_abcd_so_far = np.load(str(abcd_path))
+
+        # evaluate() hardcodes a videos_han/ subdir under output_dir; by
+        # default that is the training experiment itself, which holds the
+        # stationary-target baseline videos. Allow redirecting to a
+        # subdir (e.g. moving_target_eval) so A/B comparisons survive.
+        eval_dir = exp_path
+        if args.eval_output_subdir:
+            eval_dir = exp_path / args.eval_output_subdir
+            eval_dir.mkdir(parents=True, exist_ok=True)
 
         optimizer.evaluate(
-            output_dir=str(exp_path),
+            output_dir=str(eval_dir),
             n_episodes=args.n_final_eval,
             fps=args.fps,
             max_video_frames=args.max_video_frames,
@@ -252,7 +377,12 @@ if __name__ == "__main__":
         han_model = experiment.algorithm.get_han_model()
         if han_model is None:
             raise RuntimeError("No HanModel in policy")
-        print(f"HanModel: {han_model.total_abcd_params} ABCD params\n")
+        if args.static_mode:
+            print(f"HanModel: STATIC control — CMA-ES optimizes "
+                  f"{sum(l.W.numel() for l in han_model.get_all_han_layers())} "
+                  f"W parameters directly (Hebbian rule off, lr_hebb=0)\n")
+        else:
+            print(f"HanModel: {han_model.total_abcd_params} ABCD params\n")
 
         optimizer = CmaesHanOptimizer(
             experiment=experiment,
@@ -270,6 +400,7 @@ if __name__ == "__main__":
             orbit_radius=args.orbit_radius,
             orbit_radius_tolerance=args.orbit_radius_tolerance,
             dt_floor=args.dt_floor,
+            static_mode=args.static_mode,
         )
 
         best_abcd = optimizer.run()

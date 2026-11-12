@@ -33,6 +33,7 @@ class CmaesHanOptimizer:
         "flocking_signal_intensity",
         "simple_tag_capture",
         "hgn_formation_v1",
+        "hgn_formation_v2",
     ]
 
     def __init__(
@@ -92,11 +93,27 @@ class CmaesHanOptimizer:
         final_weight: float = 1.0,
         penalty_weight: float = 2.0,
         nav_timeout_penalty: float = 2.0,
-        # HGN formation-control fitness parameters.
+        # HGN formation-control fitness parameters (v1: tail-only collision).
         formation_reach_radius: float = 0.10,
         formation_collision_penalty: float = 2.0,
         formation_timeout_penalty: float = 2.0,
         formation_tail_frac: float = 0.10,
+        # HGN formation-control fitness parameters (v2: whole-episode
+        # collision avoidance). Same sparse +5.0 plateau as v1, but the
+        # success gate additionally requires that the *entire episode*
+        # never saw an inter-agent distance below ``formation_safety_distance``.
+        formation_safety_distance: float = 0.12,
+        formation_collision_intensity_weight: float = 4.0,
+        # Static-network control. When True, CMA-ES optimizes the plastic
+        # weight matrices W directly instead of the ABCD Hebbian
+        # parameters, and the Hebbian rule must be inert (``lr_hebb=0``).
+        #
+        # Rationale: with ``lr_hebb == 0`` the update ``W + 0*delta_W``
+        # leaves W at its random initialization forever, so ABCD has no
+        # effect at all and optimizing it would be optimizing a no-op.
+        # The meaningful control is a *trained* static feedforward
+        # network of the same architecture, which this mode produces.
+        static_mode: bool = False,
     ):
         self.experiment = experiment
         self.han_model = han_model
@@ -143,6 +160,27 @@ class CmaesHanOptimizer:
         self.formation_collision_penalty = formation_collision_penalty
         self.formation_timeout_penalty = formation_timeout_penalty
         self.formation_tail_frac = formation_tail_frac
+        # HGN formation v2 (whole-episode collision avoidance).
+        self.formation_safety_distance = formation_safety_distance
+        self.formation_collision_intensity_weight = (
+            formation_collision_intensity_weight
+        )
+        self.static_mode = static_mode
+        if static_mode:
+            active_lrs = [
+                layer.lr_hebb for layer in self.han_model.get_all_han_layers()
+            ]
+            if any(lr != 0.0 for lr in active_lrs):
+                raise ValueError(
+                    "static_mode requires lr_hebb == 0 on every layer (the "
+                    f"Hebbian rule must be inert, got {active_lrs}). With "
+                    "plasticity active, W would keep drifting and the "
+                    "static control would not be static."
+                )
+            # Skip the update entirely: even with lr_hebb == 0 the
+            # max-abs normalization would rescale W every interval and
+            # corrupt the CMA-ES candidate.
+            self.han_model.freeze_weights = True
 
         self.policy = experiment.policy
         self.rollout_policy = (
@@ -157,10 +195,29 @@ class CmaesHanOptimizer:
         self._current_gen = 0
 
     def get_abcd_vector(self) -> np.ndarray:
+        """Return the CMA-ES search vector.
+
+        In ``static_mode`` this is the flattened plastic weight matrices
+        ``W``; otherwise it is the ABCD Hebbian parameters. The rest of
+        the optimizer (ask/tell loop, fitness, save) is agnostic to which
+        one it is optimizing.
+        """
+        if self.static_mode:
+            return self.han_model.get_w_vector().detach().cpu().numpy()
         return self.han_model.get_abcd_vector().detach().cpu().numpy()
 
     def set_abcd_from_vector(self, x: np.ndarray):
-        self.han_model.set_abcd_from_vector(torch.tensor(x, device=self.device))
+        """Write a CMA-ES candidate into the model.
+
+        In ``static_mode`` this writes ``W`` *and* ``W_init`` so that the
+        subsequent ``reset_all_weights()`` call (which restores W from
+        W_init) leaves the candidate intact instead of randomizing it.
+        """
+        vec = torch.tensor(x, device=self.device)
+        if self.static_mode:
+            self.han_model.set_w_from_vector(vec)
+        else:
+            self.han_model.set_abcd_from_vector(vec)
 
     def _get_vmas_core(self):
         """Walk the wrapper chain to reach the underlying vmas Environment.
@@ -296,6 +353,7 @@ class CmaesHanOptimizer:
                          caught_step_records=None,
                          first_env_caught_at=None,
                          obstacle_dist_history=None,
+                         formation_min_pair_dist_history=None,
                          ) -> float:
         """Compute fitness value from episode data based on fitness mode.
 
@@ -481,6 +539,13 @@ class CmaesHanOptimizer:
                 pos_history=pos_history,
                 target_pos_history=target_pos_history,
                 total_steps=total_steps,
+            )
+        elif self.fitness_mode == "hgn_formation_v2":
+            return self._compute_hgn_formation_v2_fitness(
+                pos_history=pos_history,
+                target_pos_history=target_pos_history,
+                total_steps=total_steps,
+                formation_min_pair_dist_history=formation_min_pair_dist_history,
             )
         else:
             raise ValueError(f"Unknown fitness mode: {self.fitness_mode}")
@@ -967,6 +1032,80 @@ class CmaesHanOptimizer:
                 return True
         return False
 
+    def _compute_hgn_formation_v2_fitness(
+        self,
+        pos_history: list = None,
+        target_pos_history: list = None,
+        total_steps: int = 0,
+        formation_min_pair_dist_history: list = None,
+    ) -> float:
+        """HGN formation-with-collision-avoidance fitness (``hgn_formation_v2``).
+
+        Same sparse +5.0 plateau as v1, but success additionally requires
+        the *entire episode* to have stayed clear of inter-agent
+        collisions (any pairwise distance > ``formation_safety_distance``
+        at every step).
+
+        Failure branch is shaped to push CMA-ES toward *whole-episode*
+        collision-free behaviour, not just an end-state arrival:
+
+            if reached AND never_collided:
+                fitness = +formation_success_reward          # +5.0
+            else:
+                fitness = -formation_final_weight * mean_dist
+                        - formation_collision_penalty        # if collided
+                        - formation_timeout_penalty          # if max_steps hit
+                        - collision_intensity_weight * collision_frac
+
+        ``collision_frac`` = (steps with min_pairwise_dist <
+        ``formation_safety_distance``) / total_steps — gives CMA-ES a
+        continuous knob between "1 frame near miss" (small penalty) and
+        "stuck in the spawn cluster all episode" (large penalty).
+        """
+        if not pos_history:
+            return 0.0
+
+        final_pos = pos_history[-1]
+        core = getattr(self, "_vmas_core", None)
+        if core is None:
+            core = self._get_vmas_core()
+        scenario = getattr(core, "scenario", None)
+        if scenario is None or not hasattr(scenario, "formation_targets"):
+            if not target_pos_history:
+                return 0.0
+            return 0.0
+
+        target = scenario.formation_targets
+        if target.device != final_pos.device:
+            target = target.to(final_pos.device)
+
+        d = torch.linalg.vector_norm(final_pos - target, dim=-1)
+        mean_dist = d.mean().item()
+        reached = bool((d <= self.formation_reach_radius).all().item())
+
+        # Compute whole-episode collision stats.
+        collision_frac = 0.0
+        any_collided = False
+        if formation_min_pair_dist_history:
+            min_pair_t = torch.tensor(formation_min_pair_dist_history)
+            collided_mask = min_pair_t < self.formation_safety_distance
+            any_collided = bool(collided_mask.any().item())
+            collision_frac = float(collided_mask.float().mean().item())
+
+        if reached and not any_collided:
+            return float(self.success_reward)
+
+        # Failure branch.
+        fitness = -self.final_weight * mean_dist
+        if any_collided:
+            fitness -= self.formation_collision_penalty
+            # Continuous penalty for "how much" of the episode was spent
+            # inside another agent's safety band.
+            fitness -= self.formation_collision_intensity_weight * collision_frac
+        if total_steps >= self.experiment.max_steps and not reached:
+            fitness -= self.formation_timeout_penalty
+        return float(fitness)
+
     def _run_one_episode(self, env, group, max_steps, policy, on_frame=None):
         """Run a single episode and return everything needed by any fitness mode."""
         td = env.reset()
@@ -999,6 +1138,11 @@ class CmaesHanOptimizer:
         # Shape: (n_agents,). Set up after we observe the first batch.
         agent_collision_steps = None
         n_agents = None
+
+        # HGN formation v2 bookkeeping: per-step minimum inter-agent
+        # pairwise distance, so the fitness can detect *any* collision
+        # anywhere in the episode (not just the tail).
+        formation_min_pair_dist_history = []
 
         # Per-step absolute positions (N, 2) and heading angles (N,) on
         # CPU. Only populated when flocking_global fitness mode is active;
@@ -1080,6 +1224,14 @@ class CmaesHanOptimizer:
                 in_collision = dist < self.safety_distance
                 agent_in_collision = (in_radius & in_collision).any(dim=-1)  # (a,)
                 agent_collision_steps += agent_in_collision.float()
+
+                # HGN formation v2 bookkeeping: track the minimum
+                # inter-agent pairwise distance this step (using the full
+                # safety threshold, not the existing ``safety_distance``
+                # which is shared with flocking).
+                if self.fitness_mode == "hgn_formation_v2":
+                    min_pair = dist.min().item()
+                    formation_min_pair_dist_history.append(min_pair)
 
                 # Flocking fitness bookkeeping: patch each agent's heading
                 # from its current velocity direction (VMAS Holonomic does
@@ -1266,6 +1418,10 @@ class CmaesHanOptimizer:
             # distance (CPU scalar, env index 0). Empty list if the
             # fitness mode does not request it.
             "obstacle_dist_history": obstacle_dist_history,
+            # HGN formation v2: per-step min inter-agent pairwise
+            # distance (CPU scalar, env index 0). Empty list if the
+            # fitness mode does not request it.
+            "formation_min_pair_dist_history": formation_min_pair_dist_history,
         }
 
     def fitness(self, x: np.ndarray) -> float:
@@ -1301,6 +1457,7 @@ class CmaesHanOptimizer:
                     caught_step_records=stats["caught_step_records"],
                     first_env_caught_at=stats["first_env_caught_at"],
                     obstacle_dist_history=stats["obstacle_dist_history"],
+                    formation_min_pair_dist_history=stats["formation_min_pair_dist_history"],
                 )
                 fitnesses.append(ep_fitness)
 
@@ -1318,12 +1475,20 @@ class CmaesHanOptimizer:
         total_params = len(x0)
 
         layers = self.han_model.get_all_han_layers()
-        layer_info = ", ".join(
-            f"L{i}: {l.in_features}x{l.out_features} ({l.num_abcd_params})"
-            for i, l in enumerate(layers)
-        )
+        if self.static_mode:
+            layer_info = ", ".join(
+                f"L{i}: {l.in_features}x{l.out_features} ({l.W.numel()} W)"
+                for i, l in enumerate(layers)
+            )
+        else:
+            layer_info = ", ".join(
+                f"L{i}: {l.in_features}x{l.out_features} ({l.num_abcd_params})"
+                for i, l in enumerate(layers)
+            )
 
-        print(f"CMA-ES: optimizing {total_params} ABCD parameters across {len(layers)} layers")
+        param_kind = "W (static weights)" if self.static_mode else "ABCD"
+        print(f"CMA-ES: optimizing {total_params} {param_kind} parameters "
+              f"across {len(layers)} layers")
         print(f"  Layers: [{layer_info}]")
         print(f"  pop_size={self.pop_size}, sigma0={self.sigma0}, max_gens={self.max_gens}")
         print(f"  fitness_mode={self.fitness_mode}, n_eval_episodes={self.n_eval_episodes}")
@@ -1455,6 +1620,14 @@ class CmaesHanOptimizer:
             np.save(os.path.join(abcd_dir, f"layer{i}_abcd.npy"),
                     layer.get_abcd_vector().detach().cpu().numpy())
 
+        if self.static_mode:
+            # The optimized parameters are W, not ABCD. Save them under
+            # their own name so eval scripts can tell the two apart.
+            np.save(os.path.join(abcd_dir, "w_params.npy"), best_abcd)
+            for i, layer in enumerate(layers):
+                np.save(os.path.join(abcd_dir, f"layer{i}_w.npy"),
+                        layer.W.data.detach().cpu().numpy().flatten())
+
         torch.save(self.policy.state_dict(), os.path.join(abcd_dir, "policy_state.pt"))
 
         metadata = {
@@ -1464,6 +1637,8 @@ class CmaesHanOptimizer:
             "tag_num_adversaries": self.tag_num_adversaries,
             "tag_num_obstacles": self.tag_num_obstacles,
             "tag_capture_distance": self.tag_capture_distance,
+            "static_mode": self.static_mode,
+            "optimized_param_count": int(len(best_abcd)),
             "total_abcd_params": self.han_model.total_abcd_params,
             "n_layers": len(layers),
             "layer_shapes": [
@@ -1507,6 +1682,7 @@ class CmaesHanOptimizer:
 
         all_rewards = []
         all_fitnesses = []
+        all_ep_diagnostics = []
 
         with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
             for ep in range(n_episodes):
@@ -1565,8 +1741,27 @@ class CmaesHanOptimizer:
                     caught_step_records=stats["caught_step_records"],
                     first_env_caught_at=stats["first_env_caught_at"],
                     obstacle_dist_history=stats["obstacle_dist_history"],
+                    formation_min_pair_dist_history=stats["formation_min_pair_dist_history"],
                 )
                 all_fitnesses.append(ep_fitness)
+
+                # Per-episode diagnostics for the formation fitness modes:
+                # how many agents reached their slot, and how much of the
+                # episode was spent below the inter-agent safety distance.
+                ep_diag = {}
+                if self.fitness_mode in ("hgn_formation_v1", "hgn_formation_v2"):
+                    ep_diag = self._formation_eval_diagnostics(stats)
+                    all_ep_diagnostics.append(ep_diag)
+                    print(
+                        f"  ep{ep} formation: reached={ep_diag['n_reached']}"
+                        f"/{ep_diag['n_agents']}, "
+                        f"mean_final_dist={ep_diag['mean_final_dist']:.3f}, "
+                        f"collision_steps={ep_diag['collision_steps']}"
+                        f"/{ep_diag['total_steps']} "
+                        f"({ep_diag['collision_frac'] * 100:.1f}%), "
+                        f"min_pair_dist={ep_diag['min_pair_dist']:.3f} "
+                        f"(safety={self.formation_safety_distance if self.fitness_mode == 'hgn_formation_v2' else 0.10:.2f})"
+                    )
 
                 if frames:
                     vid = torch.cat(frames, dim=0).unsqueeze(0)
@@ -1583,6 +1778,102 @@ class CmaesHanOptimizer:
         print(f"\nEvaluation ({n_episodes} episodes, mode={self.fitness_mode}):")
         print(f"  Mean reward: {np.mean(all_rewards):.2f}")
         print(f"  Mean fitness: {np.mean(all_fitnesses):.2f}")
+        if all_ep_diagnostics:
+            mean_reached = np.mean(
+                [d["n_reached"] / d["n_agents"] for d in all_ep_diagnostics]
+            )
+            mean_collision_frac = np.mean(
+                [d["collision_frac"] for d in all_ep_diagnostics]
+            )
+            n_clean = sum(
+                1 for d in all_ep_diagnostics if d["collision_steps"] == 0
+            )
+            print(f"  Mean slot coverage (reached agents / total): "
+                  f"{mean_reached * 100:.1f}%")
+            print(f"  Episodes with zero collision: {n_clean}/{n_episodes}")
+            print(f"  Mean collision fraction (steps below safety dist / total): "
+                  f"{mean_collision_frac * 100:.1f}%")
         print(f"  Videos saved to: {video_dir}")
 
         return np.mean(all_fitnesses)
+
+    def _formation_eval_diagnostics(self, stats: dict) -> dict:
+        """Per-episode formation diagnostics used by ``evaluate()``.
+
+        Returns a dict with:
+          - ``n_reached`` / ``n_agents``: how many agents ended inside
+            ``formation_reach_radius`` of their assigned target.
+          - ``mean_final_dist``: mean distance to target at episode end.
+          - ``collision_steps`` / ``total_steps`` / ``collision_frac``:
+            steps where min pairwise inter-agent distance was below the
+            safety threshold (whole episode, not just the tail).
+          - ``min_pair_dist``: the smallest pairwise distance seen
+            anywhere in the episode.
+        """
+        diagnostics = {
+            "n_reached": 0,
+            "n_agents": 0,
+            "mean_final_dist": float("nan"),
+            "collision_steps": 0,
+            "total_steps": 0,
+            "collision_frac": 0.0,
+            "min_pair_dist": float("nan"),
+        }
+
+        pos_history = stats.get("pos_history") or []
+        if not pos_history:
+            return diagnostics
+
+        final_pos = pos_history[-1]
+        diagnostics["n_agents"] = int(final_pos.shape[0])
+        diagnostics["total_steps"] = len(pos_history)
+
+        core = self._get_vmas_core()
+        scenario = getattr(core, "scenario", None)
+        if scenario is not None and hasattr(scenario, "formation_targets"):
+            target = scenario.formation_targets
+            if target.device != final_pos.device:
+                target = target.to(final_pos.device)
+            d = torch.linalg.vector_norm(final_pos - target, dim=-1)
+            diagnostics["n_reached"] = int(
+                (d <= self.formation_reach_radius).sum().item()
+            )
+            diagnostics["mean_final_dist"] = float(d.mean().item())
+
+        if self.fitness_mode == "hgn_formation_v2":
+            safety = self.formation_safety_distance
+            history = stats.get("formation_min_pair_dist_history") or []
+            if history:
+                min_pair_t = torch.tensor(history)
+                collided = min_pair_t < safety
+                diagnostics["collision_steps"] = int(collided.sum().item())
+                diagnostics["collision_frac"] = float(
+                    collided.float().mean().item()
+                )
+                diagnostics["min_pair_dist"] = float(min_pair_t.min().item())
+        else:
+            # v1 has no recorded pairwise history: derive the collision
+            # count from pos_history with the hard 2*0.05 touch radius.
+            touch_dist = 2 * 0.05
+            collision_steps = 0
+            min_pair = float("inf")
+            for pos in pos_history:
+                if pos.shape[0] < 2:
+                    continue
+                diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+                dist = torch.linalg.vector_norm(diff, dim=-1)
+                n = dist.shape[0]
+                eye = torch.eye(n, device=dist.device, dtype=torch.bool)
+                dist = dist.masked_fill(eye, float("inf"))
+                step_min = dist.min().item()
+                min_pair = min(min_pair, step_min)
+                if step_min < touch_dist:
+                    collision_steps += 1
+            if min_pair != float("inf"):
+                diagnostics["min_pair_dist"] = min_pair
+            diagnostics["collision_steps"] = collision_steps
+            diagnostics["collision_frac"] = (
+                collision_steps / max(len(pos_history), 1)
+            )
+
+        return diagnostics
