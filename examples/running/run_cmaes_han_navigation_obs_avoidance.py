@@ -90,6 +90,24 @@ def parse_args():
     parser.add_argument("--f-nn", type=int, default=4)
     parser.add_argument("--f-hebb", type=int, default=1)
 
+    # Hebbian mechanism knobs (see HAN_diagnosis_and_rework_plan.md).
+    parser.add_argument("--lr-oja", type=float, default=0.0,
+                        help="Strength of the Oja stabilisation term "
+                             "(0 disables it).")
+    parser.add_argument("--d-scale", type=float, default=0.0,
+                        help="Scale of the constant D (drift) term. 0 makes "
+                             "the update purely data-driven.")
+    parser.add_argument("--stats-mode", type=str, default="per_sample",
+                        choices=["per_sample", "population"],
+                        help="How the Hebbian statistics are formed.")
+    parser.add_argument("--normalization", type=str, default="spectral",
+                        choices=["spectral", "column_maxabs", "column_l2",
+                                 "max_abs", "none"],
+                        help="Weight normalization mode.")
+    parser.add_argument("--no-normalize-stats", action="store_true",
+                        help="Disable RMS-normalisation of the recorded "
+                             "activations before the outer product.")
+
     # Compatibility kwargs (unused by navigation_obs_avoidance, but
     # listed so the CmaesHanOptimizer API stays uniform).
     parser.add_argument("--collision-penalty-weight", type=float, default=2.0)
@@ -108,10 +126,32 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--max-video-frames", type=int, default=800)
 
+    # Static-network control.
+    #
+    # CMA-ES optimises the plastic weight matrices W directly instead of
+    # the ABCD Hebbian parameters, and the Hebbian rule is switched off.
+    # This is the *meaningful* baseline for "what does plasticity buy?":
+    # a trained static feedforward network of the same architecture.
+    # (Using ``--lr-hebb 0`` instead would leave W at its random
+    # initialisation, i.e. it would measure a random network.)
+    parser.add_argument("--static-mode", action="store_true",
+                        help="Train a static network control (CMA-ES "
+                             "optimises W; the Hebbian rule is disabled).")
+
     return parser.parse_args()
 
 
 args = parse_args()
+
+# The static control must have the Hebbian rule completely inert: with
+# ``lr_hebb == 0`` the update ``W + 0*delta_W`` leaves W at its random
+# initialisation, so CMA-ES would be optimising ABCD parameters that
+# influence nothing. Instead the static control lets CMA-ES optimise W
+# directly (see ``CmaesHanOptimizer.static_mode``).
+if args.static_mode and args.lr_hebb != 0.0:
+    print(f"NOTE: --static-mode forces --lr-hebb 0 "
+          f"(was {args.lr_hebb}); plasticity would defeat the control.")
+    args.lr_hebb = 0.0
 
 
 def _get_task():
@@ -134,6 +174,11 @@ def _create_model_config():
         window_size=args.window_size,
         f_nn=args.f_nn,
         f_hebb=args.f_hebb,
+        lr_oja=args.lr_oja,
+        d_scale=args.d_scale,
+        stats_mode=args.stats_mode,
+        normalization=args.normalization,
+        normalize_stats=not args.no_normalize_stats,
         activation_class=torch.nn.Tanh,
     )
 
@@ -190,6 +235,10 @@ if __name__ == "__main__":
     print(f"HAN: hidden={args.hidden_size}, "
           f"window_size={args.window_size}, "
           f"f_nn={args.f_nn}, f_hebb={args.f_hebb}")
+    print(f"  mechanism: stats_mode={args.stats_mode}, "
+          f"normalize_stats={not args.no_normalize_stats}, "
+          f"normalization={args.normalization}, "
+          f"lr_oja={args.lr_oja}, d_scale={args.d_scale}")
     print(f"CMA-ES: pop={args.pop_size}, gens={args.cmaes_gens}, "
           f"sigma0={args.sigma0}")
     print(f"Eval episodes per candidate: {args.n_eval_episodes}")
@@ -216,7 +265,16 @@ if __name__ == "__main__":
         )
         han_model = experiment.algorithm.get_han_model()
         abcd_path = han_dir / "abcd_params.npy"
-        if abcd_path.exists():
+        w_path = han_dir / "w_params.npy"
+        if args.static_mode and w_path.exists():
+            # Static control: the optimised parameters are W, not ABCD.
+            han_model.set_w_from_vector(
+                torch.tensor(
+                    np.load(str(w_path)), device=experiment.config.train_device
+                )
+            )
+            han_model.reset_all_weights()
+        elif abcd_path.exists():
             abcd = np.load(str(abcd_path))
             han_model.set_abcd_from_vector(
                 torch.tensor(abcd, device=experiment.config.train_device)
@@ -244,6 +302,7 @@ if __name__ == "__main__":
             final_weight=args.final_weight,
             penalty_weight=args.penalty_weight,
             nav_timeout_penalty=args.nav_timeout_penalty,
+            static_mode=args.static_mode,
         )
         if abcd_path.exists():
             optimizer._best_abcd_so_far = np.load(str(abcd_path))
@@ -294,6 +353,7 @@ if __name__ == "__main__":
             final_weight=args.final_weight,
             penalty_weight=args.penalty_weight,
             nav_timeout_penalty=args.nav_timeout_penalty,
+            static_mode=args.static_mode,
         )
 
         best_abcd = optimizer.run()

@@ -153,12 +153,32 @@ def test_abcd_vector_roundtrip():
         model(td)
     post_max = model.edge_layer.W.abs().max().item()
     print(f"  edge_layer W max|W| before/after 15 steps: {pre_max:.4f} / {post_max:.4f}")
-    # After update_weights(), the spec mandates max|W| == 1.0
-    # for non-zero matrices.
-    assert abs(post_max - 1.0) < 1e-5, (
-        f"HAN rule broken: max|W|={post_max}, expected 1.0"
-    )
-    print("  HAN hard-normalization rule fires correctly: PASS")
+
+    # After update_weights(), the layer's normalization rule must hold.
+    #
+    # The legacy rule was a hard max-abs normalization (max|W| == 1.0 for
+    # any non-zero matrix). It was replaced by the "spectral" default
+    # (divide by the largest singular value), which bounds the layer's
+    # overall gain while preserving the relative gains between output
+    # units. See HAN_diagnosis_and_rework_plan.md §3.5.
+    norm_mode = model.edge_layer.normalization
+    if norm_mode == "spectral":
+        post_spectral = torch.linalg.matrix_norm(
+            model.edge_layer.W.data, ord=2
+        ).item()
+        print(f"  edge_layer W spectral norm after 15 steps: {post_spectral:.4f}")
+        assert abs(post_spectral - 1.0) < 1e-4, (
+            f"HAN normalization broken: spectral norm={post_spectral}, "
+            "expected 1.0"
+        )
+        print("  HAN spectral-normalization rule fires correctly: PASS")
+    elif norm_mode == "max_abs":
+        assert abs(post_max - 1.0) < 1e-5, (
+            f"HAN rule broken: max|W|={post_max}, expected 1.0"
+        )
+        print("  HAN hard-normalization rule fires correctly: PASS")
+    else:
+        print(f"  HAN normalization mode '{norm_mode}': no fixed-norm invariant")
 
 
 if __name__ == "__main__":

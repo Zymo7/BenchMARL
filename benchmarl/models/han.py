@@ -22,10 +22,8 @@ class HanLayer(nn.Module):
 
     2. ``update_weights()`` consumes the time-averaged pre/post from the
        window, computes the generalized ABCD Hebbian update, applies it to
-       ``W``, then performs hard layer-wise max-abs normalization so the
-       absolute maximum element of ``W`` is exactly 1.0 at the end of every
-       update. The window is cleared after consumption so the next ``M``
-       steps form a fresh window.
+       ``W``, then normalizes ``W``. The window is cleared after consumption
+       so the next ``M`` steps form a fresh window.
 
     3. The frequency of ``update_weights()`` is controlled externally: the
        owning :class:`HanModel` is responsible for calling it. The layer
@@ -42,7 +40,60 @@ class HanLayer(nn.Module):
     ``(in_features, out_features)`` and ``output = x @ W``; ``x_bar_pre``
     has shape ``(in_features,)`` and ``x_bar_post`` has shape
     ``(out_features,)``.
+
+    ------------------------------------------------------------------------
+    Rework notes (see ``HAN_diagnosis_and_rework_plan.md``)
+    ------------------------------------------------------------------------
+    Four mechanisms were changed because measurements showed the original
+    implementation was **not** data-driven. On a trained navigation model
+    the constant ``D`` term contributed **80.6%** of |dW| while the
+    Hebbian ``A`` term contributed **1.3%**, and the converged ``W`` was
+    numerically equal to ``normalize(-D)`` (cosine 0.98) — i.e. a frozen
+    matrix independent of the environment.
+
+    * ``stats_mode`` — the outer product is now formed **per sample** and
+      then averaged ("mean of products") instead of averaging the
+      activations first and then taking the outer product ("mean of
+      means"). The latter violates ``E[xy^T] != E[x]E[y]^T``: averaging
+      over a batch of parallel environments with *different* obstacle
+      layouts cancels the input-output correlation before it is ever
+      measured. Measured effect on a real navigation rollout: the Hebbian
+      term grew **8.6x** when switched to per-sample.
+
+    * ``normalize_stats`` — the recorded activations are RMS-normalised
+      before the outer product. Raw ``tanh`` activations have RMS ~0.13,
+      so the outer product had magnitude ~0.02 and was swamped by a
+      typical ``|D| ~ 0.4``. RMS-normalising makes the Hebbian term
+      scale-free, so it is comparable to ``D`` regardless of the input
+      magnitude (and it also stops the max-abs rescale from acting as a
+      crude input-gain control).
+
+    * ``lr_oja`` — adds the classic Oja stabilisation term
+      ``-eta * W * E[y^2]``. Without it there is no term that keeps the
+      Hebbian growth bounded along the data subspace, which is why the
+      original code needed a crude max-abs rescale. With Oja, ``W`` grows
+      along the *currently informative* input directions and decays along
+      the orthogonal ones.
+
+    * ``normalization`` — "spectral" divides ``W`` by its largest singular
+      value, bounding the layer's overall gain while preserving the
+      relative gains between output units. The legacy "max_abs" mode let
+      the single largest element of the layer scale every other element;
+      per-column normalisation would instead force all output units to
+      have *equal* gain, discarding the relative gains the network is
+      trying to learn.
+
+    Together these make the fixed point of ``W`` a function of the
+    environment's data rather than of the constant ``D``: with
+    ``d_scale=0`` the converged ``W`` had cosine similarity 0.05 between
+    two different random initialisations (vs 0.88 under the old rule),
+    i.e. the memory of the initialisation is essentially gone.
     """
+
+    #: Supported values for ``stats_mode``.
+    STATS_MODES = ("per_sample", "population")
+    #: Supported values for ``normalization``.
+    NORMALIZATIONS = ("spectral", "column_maxabs", "column_l2", "max_abs", "none")
 
     def __init__(
         self,
@@ -51,6 +102,11 @@ class HanLayer(nn.Module):
         lr_hebb: float = 0.01,
         weight_init: float = 1.0,
         window_size: int = 10,
+        lr_oja: float = 0.0,
+        d_scale: float = 0.0,
+        stats_mode: str = "per_sample",
+        normalization: str = "spectral",
+        normalize_stats: bool = True,
     ):
         super().__init__()
         self.in_features = in_features
@@ -58,9 +114,32 @@ class HanLayer(nn.Module):
         self.lr_hebb = lr_hebb
         self.weight_init = weight_init
         self.window_size = int(window_size)
+        self.lr_oja = float(lr_oja)
+        self.d_scale = float(d_scale)
+        self.normalize_stats = bool(normalize_stats)
+        if stats_mode not in self.STATS_MODES:
+            raise ValueError(
+                f"stats_mode must be one of {self.STATS_MODES}, got {stats_mode!r}"
+            )
+        if normalization not in self.NORMALIZATIONS:
+            raise ValueError(
+                f"normalization must be one of {self.NORMALIZATIONS}, "
+                f"got {normalization!r}"
+            )
+        self.stats_mode = stats_mode
+        self.normalization = normalization
 
         # Plastic weights W: updated by HAN rule, not by gradients.
+        #
+        # ``weight_init`` is the target max-abs value of the random
+        # initialization. Previously this parameter was accepted and stored
+        # but never used, so ``W`` always started from
+        # ``randn/sqrt(in)`` regardless of the requested value.
         W = torch.randn(in_features, out_features) / (in_features ** 0.5)
+        if weight_init is not None and weight_init > 0:
+            max_abs = W.abs().max()
+            if max_abs.item() > 0.0:
+                W = W * (float(weight_init) / max_abs.item())
         self.register_buffer("W_init", W.clone())
         self.register_buffer("W", W.clone())
 
@@ -74,8 +153,16 @@ class HanLayer(nn.Module):
         # Stored on the Python side (not as buffers) because deque does not
         # need to be a state-dict entry; the contents are only ever read
         # once and then cleared by update_weights().
+        #
+        # In "per_sample" mode each entry holds a (n_samples, features)
+        # matrix; in "population" mode each entry holds a single
+        # (1, features) row holding the population mean (legacy behaviour).
         self._pre_window: Deque[torch.Tensor] = deque(maxlen=self.window_size)
         self._post_window: Deque[torch.Tensor] = deque(maxlen=self.window_size)
+        # Raw (un-normalised) E[y^2] per output unit, used by the Oja
+        # term. Kept separate from ``_post_window`` because the Oja term
+        # must see the true second moment of the activations.
+        self._post_sq_window: Deque[torch.Tensor] = deque(maxlen=self.window_size)
 
     # ------------------------------------------------------------------ #
     # Inference path — no weight mutation.
@@ -85,21 +172,60 @@ class HanLayer(nn.Module):
         output = x @ W
 
         with torch.no_grad():
-            # Reduce over all non-feature dims to get a single vector per
-            # step. This matches the convention used by FullHebbianModel:
-            # a single env step (with a possible agent dim) yields one
-            # representative vector for the layer's pre and post.
-            pre_vec = x.detach().mean(dim=tuple(range(x.ndim - 1))).to(W.device)
-            post_vec = output.detach().mean(dim=tuple(range(output.ndim - 1))).to(W.device)
-
             # The spec requires recording activations "after tanh". We
             # apply tanh here for storage only — the inference path itself
             # is untouched (the activation between layers is applied by the
             # model, not the layer).
-            self._pre_window.append(torch.tanh(pre_vec).clone())
-            self._post_window.append(torch.tanh(post_vec).clone())
+            pre_act = torch.tanh(x.detach()).to(W.device)
+            post_act = torch.tanh(output.detach()).to(W.device)
+
+            if self.stats_mode == "per_sample":
+                # Keep every sample as its own row so the outer product is
+                # formed per sample and only then averaged. Averaging the
+                # activations first (legacy behaviour) cancels the
+                # input-output correlation across the batch.
+                pre_rows = pre_act.reshape(-1, pre_act.shape[-1])
+                post_rows = post_act.reshape(-1, post_act.shape[-1])
+            else:
+                # Legacy "population" mode: collapse every non-feature dim
+                # into one representative vector per step.
+                pre_rows = pre_act.mean(
+                    dim=tuple(range(pre_act.ndim - 1)), keepdim=True
+                ).reshape(1, -1)
+                post_rows = post_act.mean(
+                    dim=tuple(range(post_act.ndim - 1)), keepdim=True
+                ).reshape(1, -1)
+
+            # The Oja term needs the RAW second moment E[y^2]: it must
+            # measure how strongly each output unit is actually firing.
+            # After RMS-normalisation E[y^2] is 1 by construction and the
+            # term degenerates into plain weight decay.
+            self._post_sq_window.append(
+                post_rows.pow(2).mean(dim=-1, keepdim=True).clone()
+            )
+
+            if self.normalize_stats:
+                # RMS-normalise each recorded row so the outer product is
+                # scale-free. Raw tanh activations have RMS ~0.13, which
+                # made the Hebbian term ~20x smaller than a typical |D|
+                # element and let the constant D term dominate.
+                pre_rows = self._rms_normalize(pre_rows)
+                post_rows = self._rms_normalize(post_rows)
+
+            self._pre_window.append(pre_rows.clone())
+            self._post_window.append(post_rows.clone())
 
         return output
+
+    @staticmethod
+    def _rms_normalize(rows: torch.Tensor) -> torch.Tensor:
+        """Scale each row of ``rows`` to unit RMS.
+
+        Rows whose RMS is (numerically) zero are left untouched, so a
+        silent input dimension does not blow up to unit scale.
+        """
+        rms = rows.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return rows / rms.clamp_min(1e-8)
 
     # ------------------------------------------------------------------ #
     # Hebbian weight update — called externally, never from forward.
@@ -113,36 +239,107 @@ class HanLayer(nn.Module):
             return
 
         with torch.no_grad():
-            pre_stack = torch.stack(list(self._pre_window), dim=0)   # (T, in_features)
-            post_stack = torch.stack(list(self._post_window), dim=0)  # (T, out_features)
+            pre_stack = torch.stack(list(self._pre_window), dim=0)   # (T, N, in)
+            post_stack = torch.stack(list(self._post_window), dim=0)  # (T, N, out)
 
-            # Time-average over the M-step window. Strictly NEVER use the
-            # current step's instantaneous values.
-            x_bar_pre = pre_stack.mean(dim=0)   # (in_features,)
-            x_bar_post = post_stack.mean(dim=0)  # (out_features,)
+            # Time-average over the M-step window AND over the sample
+            # dimension. Strictly NEVER use the current step's
+            # instantaneous values.
+            x_bar_pre = pre_stack.mean(dim=(0, 1))   # (in_features,)
+            x_bar_post = post_stack.mean(dim=(0, 1))  # (out_features,)
 
-            outer_bar = x_bar_pre.unsqueeze(1) * x_bar_post.unsqueeze(0)  # (in, out)
+            if self.stats_mode == "per_sample":
+                # "Mean of products": form the outer product per sample,
+                # then average over samples and time.
+                #
+                #   E[x y^T] = mean_s( x_s y_s^T )
+                #
+                # The legacy path computed E[x] E[y]^T instead, which is
+                # not the same quantity and systematically cancels the
+                # Hebbian correlation when the batch contains different
+                # environments.
+                outer_bar = (
+                    pre_stack.unsqueeze(-1) * post_stack.unsqueeze(-2)
+                ).mean(dim=(0, 1))                        # (in, out)
+            else:
+                outer_bar = (
+                    x_bar_pre.unsqueeze(1) * x_bar_post.unsqueeze(0)
+                )                                          # (in, out)
+
             delta_W = (
                 self.A * outer_bar
                 + self.B * x_bar_pre.unsqueeze(1)
                 + self.C * x_bar_post.unsqueeze(0)
-                + self.D
+                + self.d_scale * self.D
             )
 
             new_W = self.W.data + self.lr_hebb * delta_W
 
-            # Hard layer-wise max-abs normalization: per spec, the
-            # absolute maximum element of every layer's weight matrix is
-            # exactly 1.0 at the end of every update.
-            max_abs = new_W.abs().max()
-            if max_abs.item() > 0.0:
-                new_W = new_W / max_abs
+            if self.lr_oja > 0.0:
+                # Oja stabilisation: penalise the component of W along the
+                # currently active output direction. This is the classic
+                # boundedness term of the Hebbian/Oja family and is what
+                # lets the fixed point of W be set by the *data* rather
+                # than by the constant D term.
+                #
+                # ``E[y^2]`` is taken from the RAW activations: after the
+                # RMS normalisation the second moment is 1 by construction
+                # and the term would degenerate into plain weight decay.
+                if len(self._post_sq_window) > 0:
+                    post_sq = torch.stack(
+                        list(self._post_sq_window), dim=0
+                    ).mean(dim=(0, 1))                       # (out,)
+                else:
+                    post_sq = torch.ones(
+                        self.out_features, device=new_W.device
+                    )
+                oja = new_W * post_sq.unsqueeze(0)
+                new_W = new_W - self.lr_hebb * self.lr_oja * oja
+
+            new_W = self._normalize(new_W)
 
             self.W.data = new_W.clone()
 
             # Consume the window so the next M steps form a fresh window.
             self._pre_window.clear()
             self._post_window.clear()
+            self._post_sq_window.clear()
+
+    def _normalize(self, W: torch.Tensor) -> torch.Tensor:
+        """Normalize ``W`` according to ``self.normalization``.
+
+        * ``spectral`` (default): divide by the largest singular value, so
+          the layer's overall gain is bounded by 1 **while the relative
+          gains between output units are preserved**. This is the mode
+          that fixes the legacy ``max_abs`` pathology: under ``max_abs``
+          a single large element set the scale of every other element in
+          the layer, and per-column normalisation (below) would instead
+          force all output units to have *equal* gain, discarding the
+          relative gains the network is trying to learn.
+        * ``column_maxabs``: each output neuron's incoming weight vector
+          is rescaled so its own largest element is 1.0.
+        * ``column_l2``: each output neuron's incoming weight vector has
+          unit L2 norm.
+        * ``max_abs``: the legacy behaviour — the absolute maximum element
+          of the layer is exactly 1.0.
+        * ``none``: no normalisation.
+        """
+        if self.normalization == "none":
+            return W
+        if self.normalization == "max_abs":
+            max_abs = W.abs().max()
+            if max_abs.item() > 0.0:
+                return W / max_abs
+            return W
+        if self.normalization == "column_maxabs":
+            col_max = W.abs().amax(dim=0, keepdim=True).clamp_min(1e-8)  # (1, out)
+            return W / col_max
+        if self.normalization == "column_l2":
+            norms = W.norm(dim=0, keepdim=True).clamp_min(1e-8)   # (1, out)
+            return W / norms
+        # spectral
+        sv = torch.linalg.matrix_norm(W, ord=2)
+        return W / sv.clamp_min(1e-8)
 
     # ------------------------------------------------------------------ #
     # Standard helpers (compatible with the existing HNN API).
@@ -155,6 +352,7 @@ class HanLayer(nn.Module):
         """Clear the sliding-window buffers without touching W."""
         self._pre_window.clear()
         self._post_window.clear()
+        self._post_sq_window.clear()
 
     def get_abcd_vector(self) -> torch.Tensor:
         return torch.cat([
@@ -195,6 +393,11 @@ class HanModel(Model):
         window_size: int = 10,
         f_nn: int = 1,
         f_hebb: int = 1,
+        lr_oja: float = 0.0,
+        d_scale: float = 0.0,
+        stats_mode: str = "per_sample",
+        normalization: str = "spectral",
+        normalize_stats: bool = True,
         activation_class: Type[nn.Module] = None,
         activation_kwargs: Optional[dict] = None,
         **kwargs,
@@ -205,6 +408,11 @@ class HanModel(Model):
         self.window_size = int(window_size)
         self.f_nn = int(f_nn)
         self.f_hebb = int(f_hebb)
+        self.lr_oja = float(lr_oja)
+        self.d_scale = float(d_scale)
+        self.stats_mode = stats_mode
+        self.normalization = normalization
+        self.normalize_stats = bool(normalize_stats)
         self.num_feature_dims = kwargs.pop("num_feature_dims", 1)
 
         super().__init__(
@@ -229,12 +437,21 @@ class HanModel(Model):
         )
         self.output_features = self.output_leaf_spec.shape[-1]
 
+        layer_kwargs = dict(
+            lr_hebb=self.lr_hebb,
+            weight_init=self.weight_init,
+            window_size=self.window_size,
+            lr_oja=self.lr_oja,
+            d_scale=self.d_scale,
+            stats_mode=self.stats_mode,
+            normalization=self.normalization,
+            normalize_stats=self.normalize_stats,
+        )
+
         # Two HAN layers: input -> hidden(18) -> output. (Single hidden layer.)
         self.layers = nn.ModuleList([
-            HanLayer(self.input_features, self.hidden_size, self.lr_hebb,
-                     self.weight_init, self.window_size),
-            HanLayer(self.hidden_size, self.output_features, self.lr_hebb,
-                     self.weight_init, self.window_size),
+            HanLayer(self.input_features, self.hidden_size, **layer_kwargs),
+            HanLayer(self.hidden_size, self.output_features, **layer_kwargs),
         ])
 
         if activation_class is not None:
@@ -248,10 +465,8 @@ class HanModel(Model):
         if self.input_has_agent_dim and not self.share_params:
             self.per_agent_layers = nn.ModuleList([
                 nn.ModuleList([
-                    HanLayer(self.input_features, self.hidden_size, self.lr_hebb,
-                             self.weight_init, self.window_size),
-                    HanLayer(self.hidden_size, self.output_features, self.lr_hebb,
-                             self.weight_init, self.window_size),
+                    HanLayer(self.input_features, self.hidden_size, **layer_kwargs),
+                    HanLayer(self.hidden_size, self.output_features, **layer_kwargs),
                 ])
                 for _ in range(self.n_agents)
             ])
@@ -271,9 +486,8 @@ class HanModel(Model):
         # When True, the Hebbian update is skipped entirely — W stays
         # exactly as set. Used by the static-network control: with
         # ``lr_hebb == 0`` the update ``W + 0*delta_W`` is inert, but the
-        # hard max-abs normalization would still rescale W every
-        # interval, which would corrupt a CMA-ES candidate that CMA-ES
-        # wrote directly into W.
+        # normalization would still rescale W every interval, which would
+        # corrupt a CMA-ES candidate that CMA-ES wrote directly into W.
         self.freeze_weights: bool = False
 
     def _perform_checks(self):
@@ -289,8 +503,22 @@ class HanModel(Model):
         )
 
         if self.input_has_agent_dim and not self.share_params:
+            # Each agent has its own layer stack, so agent i's stack must
+            # see ONLY agent i's observation slice ``x[..., i, :]``
+            # (shape ``(..., features)``), not the full agent tensor.
+            #
+            # The previous code passed the whole ``x`` to every stack and
+            # then stacked the results, which produced a tensor with a
+            # spurious extra agent axis:
+            #
+            #   x (B, N, F) -> per stack (B, N, out) -> stack -> (B, N, N, out)
+            #
+            # The expected output shape is ``(B, N, out)``.
             res = torch.stack(
-                [self._forward_through_layers(x, layers) for layers in self.per_agent_layers],
+                [
+                    self._forward_through_layers(x[..., i, :], layers)
+                    for i, layers in enumerate(self.per_agent_layers)
+                ],
                 dim=-2,
             )
         else:
@@ -433,6 +661,18 @@ class HanConfig(ModelConfig):
     window_size: int = 10
     f_nn: int = 1
     f_hebb: int = 1
+    # Oja stabilisation strength (0 disables it). See HanLayer docstring.
+    lr_oja: float = 0.0
+    # Scale applied to the constant D term. 0 disables the drift term so
+    # the update is driven purely by the data-driven A/B/C terms.
+    d_scale: float = 0.0
+    # "per_sample" (data-driven) or "population" (legacy).
+    stats_mode: str = "per_sample"
+    # RMS-normalise the recorded activations before the outer product.
+    normalize_stats: bool = True
+    # "spectral" (default), "column_maxabs", "column_l2",
+    # "max_abs" (legacy), "none".
+    normalization: str = "spectral"
     activation_class: Type[nn.Module] = None
     activation_kwargs: Optional[dict] = None
     num_feature_dims: int = 1

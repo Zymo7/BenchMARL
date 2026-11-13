@@ -431,6 +431,14 @@ class CmaesHanOptimizer:
             # an obstacle. The composite is just two scalars + a binary
             # success term so that HAN's online weight updates have a
             # simple target to converge to.
+            #
+            # IMPORTANT: ``success`` now means "the agent actually reached
+            # the goal", not "the episode ended". See the success/timeout
+            # block in ``_run_one_episode`` — the previous implementation
+            # derived ``success`` from the ``done`` flag, which VMAS also
+            # raises at the ``max_steps`` horizon, so *every* episode was
+            # scored as a success and the fitness degenerated into a
+            # binary "did you touch an obstacle" test.
             if initial_goal_dists is None or final_goal_dists is None:
                 raise ValueError(
                     "navigation_obs_avoidance mode requires initial/final "
@@ -1346,8 +1354,19 @@ class CmaesHanOptimizer:
                 done = bool(done_t[0].item())
             else:
                 done = bool(done_t.item())
-            if done:
-                success = True
+            # NOTE: ``done`` is NOT the same as "reached the goal".
+            #
+            # VMAS terminates the episode when ``max_steps`` is reached
+            # (torchrl's VmasEnv sets ``done=True`` at the horizon and
+            # does not set a separate ``truncated`` flag). Treating
+            # ``done`` as success therefore marked an agent that was
+            # still 1.04 world units away from the goal as a success,
+            # which made the ``navigation_obs_avoidance`` fitness blind
+            # to everything except obstacle contact.
+            #
+            # ``success`` is now derived from the *goal distance* (see
+            # ``reached`` below), and ``timed_out`` records that the
+            # episode ended at the horizon without reaching the goal.
             td = td.get("next")
             step += 1
 
@@ -1390,6 +1409,38 @@ class CmaesHanOptimizer:
             initial_goal_dists = init_dist.unsqueeze(0)
             final_goal_dists = final_dist.unsqueeze(0)
 
+        # ------------------------------------------------------------------ #
+        # Success / timeout semantics.
+        #
+        # ``done`` fires both when the scenario's goal condition is met AND
+        # when the ``max_steps`` horizon is reached, so it cannot be used
+        # on its own to decide "did the agent reach the goal".
+        #
+        # ``reached``    — the agent ended within the goal radius.
+        # ``timed_out``  — the episode ended at the horizon without doing so.
+        #
+        # For the goal radius we reuse the scenario's own definition
+        # (``distance_to_goal < goal.shape.radius``) so that "reached"
+        # means exactly what the environment means by "on goal".
+        # ------------------------------------------------------------------ #
+        reached = False
+        timed_out = False
+        if use_sim_goal_dist and getattr(self, "_vmas_core", None) is not None:
+            core = self._vmas_core
+            goal = getattr(core.agents[0], "goal", None)
+            goal_radius = None
+            if goal is not None and getattr(goal, "shape", None) is not None:
+                goal_radius = float(goal.shape.radius)
+            if goal_radius is None:
+                goal_radius = float(self.obstacle_agent_radius)
+            reached = bool((final_goal_dists < goal_radius).any().item())
+        else:
+            # Fallback for non-VMAS / observation-relative layouts: use the
+            # ``done`` flag but exclude the horizon case.
+            reached = bool(done) and step < max_steps
+        timed_out = (not reached) and step >= max_steps
+        success = reached
+
         # Per-agent collision ratio = (steps in collision) / total_steps.
         # If n_agents is 1, no inter-agent collisions possible.
         if n_agents is not None and n_agents > 1 and step > 0:
@@ -1403,6 +1454,8 @@ class CmaesHanOptimizer:
             "collision_count": collision_count,
             "step": step,
             "success": success,
+            "reached": reached,
+            "timed_out": timed_out,
             "initial_goal_dists": initial_goal_dists,
             "final_goal_dists": final_goal_dists,
             "agent_collision_ratios": agent_collision_ratios,
