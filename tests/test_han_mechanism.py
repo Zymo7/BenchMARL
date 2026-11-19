@@ -334,7 +334,85 @@ def check_per_agent_layer_stacking_shape():
         )
 
 
-def check_model_config_exposes_new_mechanism_knobs():
+def check_reward_modulation_changes_update_direction():
+    """A reward above the baseline must push W along the observed
+    input-output correlation and a reward below it must push the other way.
+    ``lr_reward=0`` must ignore the reward entirely, and the modulation must
+    be per sample: a reward that is high in one sample and low in another
+    must not cancel before it is applied."""
+    torch.manual_seed(0)
+    x = torch.randn(4, 1, 6)
+
+    def run(lr_reward, reward):
+        torch.manual_seed(0)
+        layer = HanLayer(6, 4, lr_hebb=1.0, window_size=10, d_scale=0.0,
+                         stats_mode="per_sample", normalize_stats=True,
+                         normalization="none", lr_reward=lr_reward)
+        layer.A.data.zero_()
+        for _ in range(4):
+            layer(x, reward)
+        before = layer.W.data.clone()
+        layer.update_weights()
+        return layer.W.data - before
+
+    # The baseline starts at 0, so a constant +1 is above it and a constant
+    # -1 is below it: the two updates must be opposite in sign.
+    positive = run(1.0, torch.ones(4, 1, 1))
+    negative = run(1.0, -torch.ones(4, 1, 1))
+    disabled = run(0.0, torch.ones(4, 1, 1))
+
+    cos = torch.nn.functional.cosine_similarity(
+        positive.flatten(), negative.flatten(), dim=0
+    ).item()
+    assert cos < -0.99, (
+        f"a reward below the baseline must reverse the update (cos={cos:.4f})"
+    )
+    assert positive.abs().mean().item() > 0.0, (
+        "a non-zero reward produced no weight change"
+    )
+    # With the term switched off the update must be exactly the plain
+    # Hebbian update, which here is zero because A is zero.
+    assert disabled.abs().max().item() == 0.0, (
+        "lr_reward=0 must not let the reward affect W"
+    )
+
+    # Per-sample, not mean-then-multiply. Two samples with opposite rewards
+    # and different activation patterns must NOT cancel: each sample's
+    # correlation is reinforced or punished on its own. If the reward were
+    # averaged first the mean advantage would be ~0 and the update would
+    # vanish. (The two patterns must not be scalar multiples of each other,
+    # because RMS-normalisation would collapse those into one direction.)
+    torch.manual_seed(1)
+    x_pos = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0]).view(1, 1, 6)
+    x_neg = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).view(1, 1, 6)
+    layer = HanLayer(6, 4, lr_hebb=1.0, window_size=10, d_scale=0.0,
+                     stats_mode="per_sample", normalize_stats=True,
+                     normalization="none", lr_reward=1.0)
+    layer.A.data.zero_()
+    layer(x_pos, torch.ones(1, 1, 1))
+    layer(x_neg, -torch.ones(1, 1, 1))
+    before = layer.W.data.clone()
+    layer.update_weights()
+    assert (layer.W.data - before).abs().mean().item() > 0.01, (
+        "per-sample modulation cancelled: opposite rewards were averaged "
+        "before being applied to their own activations"
+    )
+
+
+def check_missing_reward_is_treated_as_zero():
+    """The first step of an episode has no reward yet. Passing ``None``
+    must not raise and must not move W through the reward term."""
+    layer = HanLayer(6, 4, lr_hebb=1.0, window_size=10, d_scale=0.0,
+                     stats_mode="per_sample", normalization="none",
+                     lr_reward=1.0)
+    layer.A.data.zero_()
+    layer(torch.randn(3, 1, 6), reward=None)
+    before = layer.W.data.clone()
+    layer.update_weights()
+    assert torch.allclose(before, layer.W.data)
+
+
+def check_config_exposes_mechanism_knobs():
     """The new mechanism knobs must be reachable from ``HanConfig``."""
     cfg = HanConfig(hidden_size=6, lr_oja=0.25, d_scale=0.0,
                     stats_mode="per_sample", normalization="spectral",
@@ -344,6 +422,101 @@ def check_model_config_exposes_new_mechanism_knobs():
     assert cfg.stats_mode == "per_sample"
     assert cfg.normalization == "spectral"
     assert cfg.normalize_stats is True
+
+
+def check_reward_baseline_resets_per_episode():
+    """The baseline must not carry the previous episode's reward level."""
+    layer = HanLayer(6, 4, lr_reward=1.0)
+    for _ in range(3):
+        layer(torch.randn(2, 1, 6), torch.full((2, 1, 1), -5.0))
+        layer.update_weights()
+    assert layer._reward_baseline < -0.5
+    layer.reset_reward_baseline()
+    assert layer._reward_baseline == 0.0
+
+
+def check_advantage_is_clipped():
+    """One huge spike must not move W more than a clipped-size advantage."""
+    def delta(r):
+        torch.manual_seed(0)
+        layer = HanLayer(6, 4, lr_hebb=1.0, d_scale=0.0, normalization="none",
+                         lr_reward=1.0, advantage_clip=1.0)
+        layer.A.data.zero_()
+        x = torch.randn(3, 1, 6)
+        torch.manual_seed(0)
+        before = layer.W.data.clone()
+        layer(x, torch.full((3, 1, 1), r))
+        layer.update_weights()
+        return layer.W.data - before
+    assert torch.allclose(delta(100.0), delta(10.0), atol=1e-6)
+
+
+class _FakeState:
+    def __init__(self, pos):
+        self.pos = torch.tensor([pos])
+
+
+class _FakeEntity:
+    def __init__(self, pos):
+        self.state = _FakeState(pos)
+
+
+def _fake_optimizer(**kw):
+    from benchmarl.algorithms.cmaes_han_optimizer import CmaesHanOptimizer
+    opt = CmaesHanOptimizer.__new__(CmaesHanOptimizer)
+    opt.obstacle_agent_radius = 0.10
+    opt.obstacle_obstacle_radius = 0.15
+    opt.obstacle_safety_distance = 0.30
+    opt.modulation_obs_weight = 1.0
+    opt.modulation_step_scale = 0.036
+    for k, v in kw.items():
+        setattr(opt, k, v)
+    return opt
+
+
+def check_shaped_modulation_sign():
+    """m_t > 0 when moving toward the goal far from obstacles; m_t < 0
+    when moving away or when hugging an obstacle."""
+    from types import SimpleNamespace
+    agent = _FakeEntity([0.0, 0.0])
+    agent.goal = _FakeEntity([1.0, 0.0])
+    far_obstacle = _FakeEntity([-5.0, -5.0])
+    opt = _fake_optimizer()
+    opt._vmas_core = SimpleNamespace(
+        agents=[agent], scenario=SimpleNamespace(obstacles=[far_obstacle]))
+
+    prev = opt._sim_goal_dists()
+    agent.state.pos = torch.tensor([[0.03, 0.0]])          # toward goal
+    m, prev = opt._shaped_modulation(prev)
+    assert m.item() > 0.5, m.item()
+    agent.state.pos = torch.tensor([[0.0, 0.0]])           # away from goal
+    m, prev = opt._shaped_modulation(prev)
+    assert m.item() < -0.5, m.item()
+
+    # Standing still right next to an obstacle: pure danger penalty.
+    opt._vmas_core.scenario.obstacles = [_FakeEntity([0.0, 0.251])]
+    m, prev = opt._shaped_modulation(prev)
+    assert m.item() < -0.9, m.item()
+
+
+def check_progress_term_ranks_walking_away_below_standing_still():
+    """With progress_weight > 0 the failure branch must rank
+    toward-goal > stood-still > walked-away for equal obstacle exposure."""
+    from types import SimpleNamespace
+    opt = _fake_optimizer(
+        fitness_mode="navigation_obs_avoidance", success_reward=5.0,
+        final_weight=0.0, penalty_weight=2.0, nav_timeout_penalty=2.0,
+        progress_weight=2.0,
+        experiment=SimpleNamespace(max_steps=800))
+    far = [torch.tensor(1.0)] * 10
+
+    def fit(final):
+        return opt._compute_fitness(
+            0.0, 0, 10, initial_goal_dists=torch.tensor([1.0]),
+            final_goal_dists=torch.tensor([final]), success=False,
+            obstacle_dist_history=far)
+    assert fit(0.5) > fit(1.0) > fit(1.5), (fit(0.5), fit(1.0), fit(1.5))
+    assert fit(0.0) < 5.0  # still below the success reward
 
 
 def _run_all():

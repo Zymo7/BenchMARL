@@ -65,6 +65,10 @@ def parse_args():
                         help="Weight on final_goal_dist in the failure branch.")
     parser.add_argument("--penalty-weight", type=float, default=2.0,
                         help="Weight on penalty_ratio in the failure branch.")
+    parser.add_argument("--progress-weight", type=float, default=0.0,
+                        help="Weight of the relative goal progress "
+                             "(init-final)/init in [-1, 1] in the failure "
+                             "branch. 0 keeps the previous fitness.")
     parser.add_argument("--nav-timeout-penalty", type=float, default=2.0,
                         help="Extra penalty when the episode ran to "
                              "max_steps without success.")
@@ -107,6 +111,18 @@ def parse_args():
     parser.add_argument("--no-normalize-stats", action="store_true",
                         help="Disable RMS-normalisation of the recorded "
                              "activations before the outer product.")
+    parser.add_argument("--lr-reward", type=float, default=0.0,
+                        help="Strength of the reward-modulated (three-factor) "
+                             "Hebbian term. 0 disables it.")
+    parser.add_argument("--modulation-source", type=str, default="env",
+                        choices=["env", "shaped"],
+                        help="Third factor of the reward term: the env reward "
+                             "or the shaped signal m_t = goal progress - "
+                             "lambda * obstacle danger.")
+    parser.add_argument("--modulation-obs-weight", type=float, default=1.0,
+                        help="lambda: weight of the obstacle-danger part of m_t.")
+    parser.add_argument("--advantage-clip", type=float, default=1.0,
+                        help="Clip on |m - baseline| per sample in the reward term.")
 
     # Compatibility kwargs (unused by navigation_obs_avoidance, but
     # listed so the CmaesHanOptimizer API stays uniform).
@@ -137,6 +153,11 @@ def parse_args():
     parser.add_argument("--static-mode", action="store_true",
                         help="Train a static network control (CMA-ES "
                              "optimises W; the Hebbian rule is disabled).")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Experiment seed. The same seed makes the "
+                             "plastic and static runs face identical task "
+                             "instances, which is required for a fair "
+                             "comparison.")
 
     return parser.parse_args()
 
@@ -179,6 +200,10 @@ def _create_model_config():
         stats_mode=args.stats_mode,
         normalization=args.normalization,
         normalize_stats=not args.no_normalize_stats,
+        lr_reward=args.lr_reward,
+        modulation_key=("modulation" if args.modulation_source == "shaped"
+                        else "reward"),
+        advantage_clip=args.advantage_clip,
         activation_class=torch.nn.Tanh,
     )
 
@@ -191,7 +216,8 @@ def _create_critic_model_config():
     )
 
 
-def _setup_experiment_for_cmaes(task, model_config, critic_model_config, output_dir):
+def _setup_experiment_for_cmaes(task, model_config, critic_model_config, output_dir,
+                               seed=0):
     experiment_config = ExperimentConfig.get_from_yaml()
     experiment_config.max_n_iters = 1
     experiment_config.save_folder = str(output_dir)
@@ -201,7 +227,7 @@ def _setup_experiment_for_cmaes(task, model_config, critic_model_config, output_
         algorithm_config=CmaesHanConfig.get_from_yaml(),
         model_config=model_config,
         critic_model_config=critic_model_config,
-        seed=0,
+        seed=seed,
         config=experiment_config,
     )
     experiment._setup()
@@ -230,7 +256,8 @@ if __name__ == "__main__":
         print(f"  success_reward={args.success_reward}, "
               f"final_weight={args.final_weight}, "
               f"penalty_weight={args.penalty_weight}, "
-              f"nav_timeout_penalty={args.nav_timeout_penalty}")
+              f"nav_timeout_penalty={args.nav_timeout_penalty}, "
+              f"progress_weight={args.progress_weight}")
         print(f"  obstacle_safety_distance={args.obstacle_safety_distance}")
     print(f"HAN: hidden={args.hidden_size}, "
           f"window_size={args.window_size}, "
@@ -238,7 +265,11 @@ if __name__ == "__main__":
     print(f"  mechanism: stats_mode={args.stats_mode}, "
           f"normalize_stats={not args.no_normalize_stats}, "
           f"normalization={args.normalization}, "
-          f"lr_oja={args.lr_oja}, d_scale={args.d_scale}")
+          f"lr_oja={args.lr_oja}, d_scale={args.d_scale}, "
+          f"lr_reward={args.lr_reward}")
+    print(f"  modulation: source={args.modulation_source}, "
+          f"obs_weight={args.modulation_obs_weight}, "
+          f"advantage_clip={args.advantage_clip}")
     print(f"CMA-ES: pop={args.pop_size}, gens={args.cmaes_gens}, "
           f"sigma0={args.sigma0}")
     print(f"Eval episodes per candidate: {args.n_eval_episodes}")
@@ -256,7 +287,7 @@ if __name__ == "__main__":
               f"fitness={metadata['best_fitness']}")
 
         experiment = _setup_experiment_for_cmaes(
-            task, model_config, critic_model_config, output_dir
+            task, model_config, critic_model_config, output_dir, seed=args.seed
         )
         policy_path = han_dir / "policy_state.pt"
         experiment.policy.load_state_dict(
@@ -302,6 +333,9 @@ if __name__ == "__main__":
             final_weight=args.final_weight,
             penalty_weight=args.penalty_weight,
             nav_timeout_penalty=args.nav_timeout_penalty,
+            progress_weight=args.progress_weight,
+            modulation_source=args.modulation_source,
+            modulation_obs_weight=args.modulation_obs_weight,
             static_mode=args.static_mode,
         )
         if abcd_path.exists():
@@ -315,7 +349,7 @@ if __name__ == "__main__":
         )
     else:
         experiment = _setup_experiment_for_cmaes(
-            task, model_config, critic_model_config, output_dir
+            task, model_config, critic_model_config, output_dir, seed=args.seed
         )
         han_model = experiment.algorithm.get_han_model()
         if han_model is None:
@@ -353,6 +387,9 @@ if __name__ == "__main__":
             final_weight=args.final_weight,
             penalty_weight=args.penalty_weight,
             nav_timeout_penalty=args.nav_timeout_penalty,
+            progress_weight=args.progress_weight,
+            modulation_source=args.modulation_source,
+            modulation_obs_weight=args.modulation_obs_weight,
             static_mode=args.static_mode,
         )
 

@@ -93,6 +93,17 @@ class CmaesHanOptimizer:
         final_weight: float = 1.0,
         penalty_weight: float = 2.0,
         nav_timeout_penalty: float = 2.0,
+        # navigation_obs_avoidance: weight of the relative goal progress
+        # in the failure branch (0 = previous fitness).
+        progress_weight: float = 0.0,
+        # Third-factor signal for the reward-modulated Hebbian term:
+        # "env" = the env reward (HanModel reads ``reward``), "shaped" =
+        # m_t below, written to ``(group, "modulation")`` each step.
+        modulation_source: str = "env",
+        modulation_obs_weight: float = 1.0,
+        # Normaliser for the per-step goal progress: the agent's max
+        # per-step displacement (measured ~0.036 for this scenario).
+        modulation_step_scale: float = 0.036,
         # HGN formation-control fitness parameters (v1: tail-only collision).
         formation_reach_radius: float = 0.10,
         formation_collision_penalty: float = 2.0,
@@ -152,6 +163,15 @@ class CmaesHanOptimizer:
             penalty_weight if penalty_weight != 2.0 else obstacle_penalty_weight
         )
         self.nav_timeout_penalty = nav_timeout_penalty
+        self.progress_weight = float(progress_weight)
+        if modulation_source not in ("env", "shaped"):
+            raise ValueError(
+                f"modulation_source must be 'env' or 'shaped', "
+                f"got {modulation_source!r}"
+            )
+        self.modulation_source = modulation_source
+        self.modulation_obs_weight = float(modulation_obs_weight)
+        self.modulation_step_scale = float(modulation_step_scale)
         self.obstacle_safety_distance = obstacle_safety_distance
         self.obstacle_agent_radius = obstacle_agent_radius
         self.obstacle_obstacle_radius = obstacle_obstacle_radius
@@ -482,7 +502,15 @@ class CmaesHanOptimizer:
             # Failure branch: agent did not arrive safely. Encourage
             # proximity to the goal while penalising how much of the
             # episode was spent in the safety band.
+            # Relative goal progress in [-1, 1]: negative when the agent
+            # ended farther from the goal than it started, so "walked
+            # away" scores below "stood still".
+            init = initial_goal_dists.float().mean().item()
+            progress = 0.0
+            if init > 1e-6:
+                progress = max(-1.0, min(1.0, (init - mean_final) / init))
             fitness = (
+                self.progress_weight * progress
                 - self.final_weight * mean_final
                 - self.penalty_weight * penalty_ratio
             )
@@ -1114,6 +1142,47 @@ class CmaesHanOptimizer:
             fitness -= self.formation_timeout_penalty
         return float(fitness)
 
+    def _sim_goal_dists(self) -> torch.Tensor:
+        """Distance of every agent to its own goal, shape ``(B, n_agents)``."""
+        core = self._vmas_core
+        return torch.stack(
+            [torch.linalg.vector_norm(a.state.pos - a.goal.state.pos, dim=-1)
+             for a in core.agents],
+            dim=-1,
+        )
+
+    def _shaped_modulation(self, prev_goal_dist: torch.Tensor):
+        """Per-step third factor for the reward-modulated Hebbian term::
+
+            m_t = progress_t - lambda_obs * danger_t
+            progress_t = (d_goal(t-1) - d_goal(t)) / step_scale   (~[-1, 1])
+            danger_t   = clamp((d_safe - d_obs) / (d_safe - d_min), 0, 1)
+
+        It uses the same two quantities as the navigation_obs_avoidance
+        fitness (goal progress, obstacle proximity) so the in-episode
+        signal and the CMA-ES objective point the same way.
+
+        Returns ``(m_t (B, n_agents), current goal distance)``.
+        """
+        core = self._vmas_core
+        goal_dist = self._sim_goal_dists()
+        progress = ((prev_goal_dist - goal_dist)
+                    / self.modulation_step_scale).clamp(-1.0, 1.0)
+
+        danger = torch.zeros_like(progress)
+        obstacles = getattr(getattr(core, "scenario", None), "obstacles", [])
+        if obstacles:
+            d_min = self.obstacle_agent_radius + self.obstacle_obstacle_radius
+            d_safe = max(self.obstacle_safety_distance, d_min + 1e-6)
+            obs_pos = torch.stack([o.state.pos for o in obstacles], dim=1)  # (B, K, 2)
+            for i, a in enumerate(core.agents):
+                d_obs = torch.linalg.vector_norm(
+                    a.state.pos.unsqueeze(1) - obs_pos, dim=-1
+                ).min(dim=-1).values                                       # (B,)
+                danger[:, i] = ((d_safe - d_obs) / (d_safe - d_min)).clamp(0.0, 1.0)
+
+        return progress - self.modulation_obs_weight * danger, goal_dist
+
     def _run_one_episode(self, env, group, max_steps, policy, on_frame=None):
         """Run a single episode and return everything needed by any fitness mode."""
         td = env.reset()
@@ -1134,6 +1203,13 @@ class CmaesHanOptimizer:
         # goal-relative offset. We instead compute initial / final goal
         # distances from simulator state (single-env, env index 0).
         use_sim_goal_dist = self.fitness_mode == "navigation_obs_avoidance"
+        # Snapshot the start position NOW: reading ``state.pos`` after the
+        # rollout returns the *final* position, which made initial == final.
+        sim_agent_pos_init = None
+        if use_sim_goal_dist and getattr(self, "_vmas_core", None) is not None:
+            sim_agent_pos_init = (
+                self._vmas_core.agents[0].state.pos[0].detach().clone()
+            )
 
         episode_reward = 0.0
         collision_count = 0
@@ -1177,6 +1253,11 @@ class CmaesHanOptimizer:
         # the active fitness mode requests it.
         obstacle_dist_history = []
 
+        # Shaped modulation signal m_t (see ``_shaped_modulation``).
+        shaped = (self.modulation_source == "shaped"
+                  and getattr(self, "_vmas_core", None) is not None)
+        prev_goal_dist = (self._sim_goal_dists() if shaped else None)
+
         while not done and step < max_steps:
             td = policy(td)
             self._set_pettingzoo_tag_evader_action(td)
@@ -1187,6 +1268,11 @@ class CmaesHanOptimizer:
 
             reward = td.get(("next", group, "reward"))
             episode_reward += reward.sum().item()
+
+            if shaped:
+                m_t, prev_goal_dist = self._shaped_modulation(prev_goal_dist)
+                td.set(("next", group, "modulation"),
+                       m_t.reshape(reward.shape).to(reward.dtype))
 
             info = td.get(("next", group, "info"), None)
             if info is not None:
@@ -1390,8 +1476,10 @@ class CmaesHanOptimizer:
         # keep the contract consistent across modes.
         if use_sim_goal_dist and getattr(self, "_vmas_core", None) is not None:
             core = self._vmas_core
-            agent_pos_init = core.agents[0].state.pos[0]
-            agent_pos_final = agent_pos_init  # default: fall back if step==0
+            agent_pos_now = core.agents[0].state.pos[0]
+            agent_pos_init = (sim_agent_pos_init if sim_agent_pos_init is not None
+                              else agent_pos_now)
+            agent_pos_final = agent_pos_now  # default: fall back if step==0
             goal_pos = core.agents[0].goal.state.pos[0]
             # Walk the pos_history collected in this episode: the last
             # CPU entry is the post-step absolute position of the agent.

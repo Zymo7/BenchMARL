@@ -75,6 +75,34 @@ class HanLayer(nn.Module):
       along the *currently informative* input directions and decays along
       the orthogonal ones.
 
+    * ``lr_reward`` — reward-modulated Hebbian (three-factor) term. The
+      plain Hebbian update only reinforces whatever input-output correlation
+      happens to be present, which is not the same as "the action that
+      worked". The environment's reward is the only signal that says which
+      of those correlations were useful, so it is folded in as
+
+          delta_W += lr_reward * mean_s[ (r_s - r_baseline) * x_s y_s^T ]
+
+      Two details matter and both are easy to get wrong:
+
+      1. The modulation is **per sample**, not ``mean(r) * mean(x y^T)``.
+         The latter averages the reward across the parallel environments
+         first, so a collision in environment A punishes the perfectly
+         reasonable action taken in environment B. It is the same
+         ``E[r xy^T] != E[r] E[xy^T]`` mistake the A term used to make.
+
+      2. The reward is taken **relative to a baseline**. The raw reward of
+         this task is almost always negative (the collision penalty
+         dominates the tiny distance-shaping term), so without a baseline
+         the term is a constant anti-Hebbian decay rather than "this was
+         better than usual". The baseline is an exponential moving average
+         of the per-window mean reward, shared across the parallel
+         environments and reset at the start of every episode.
+
+      The reward for step ``t`` is the one the action taken at step ``t``
+      earned (see ``HanModel._forward``). ``lr_reward == 0`` disables the
+      term, so existing behaviour is unchanged unless it is switched on.
+
     * ``normalization`` — "spectral" divides ``W`` by its largest singular
       value, bounding the layer's overall gain while preserving the
       relative gains between output units. The legacy "max_abs" mode let
@@ -107,6 +135,8 @@ class HanLayer(nn.Module):
         stats_mode: str = "per_sample",
         normalization: str = "spectral",
         normalize_stats: bool = True,
+        lr_reward: float = 0.0,
+        advantage_clip: float = 1.0,
     ):
         super().__init__()
         self.in_features = in_features
@@ -117,6 +147,11 @@ class HanLayer(nn.Module):
         self.lr_oja = float(lr_oja)
         self.d_scale = float(d_scale)
         self.normalize_stats = bool(normalize_stats)
+        # Strength of the reward-modulated term. 0 keeps the update exactly
+        # as it was before this term existed.
+        self.lr_reward = float(lr_reward)
+        # Bound on |r - baseline| per sample in the reward term.
+        self.advantage_clip = float(advantage_clip)
         if stats_mode not in self.STATS_MODES:
             raise ValueError(
                 f"stats_mode must be one of {self.STATS_MODES}, got {stats_mode!r}"
@@ -163,11 +198,20 @@ class HanLayer(nn.Module):
         # term. Kept separate from ``_post_window`` because the Oja term
         # must see the true second moment of the activations.
         self._post_sq_window: Deque[torch.Tensor] = deque(maxlen=self.window_size)
+        # Reward earned by the action taken at each recorded step, one scalar
+        # per sample. Only read when ``lr_reward != 0``.
+        self._reward_window: Deque[torch.Tensor] = deque(maxlen=self.window_size)
+        # Baseline for the reward modulation: an exponential moving average of
+        # the per-window mean reward. A plain buffer (not a registered one)
+        # because it is bookkeeping, not part of the candidate being
+        # optimized, and it must survive ``reset_weights``.
+        self._reward_baseline: float = 0.0
+        self._reward_baseline_momentum: float = 0.9
 
     # ------------------------------------------------------------------ #
     # Inference path — no weight mutation.
     # ------------------------------------------------------------------ #
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reward: torch.Tensor = None) -> torch.Tensor:
         W = self.W.data
         output = x @ W
 
@@ -214,6 +258,24 @@ class HanLayer(nn.Module):
 
             self._pre_window.append(pre_rows.clone())
             self._post_window.append(post_rows.clone())
+
+            if self.lr_reward != 0.0:
+                # ``reward`` is the reward earned by the action taken from
+                # the observation that produced ``x`` — i.e. the previous
+                # step's reward, not the one this forward pass will earn.
+                # A missing reward (the first step of an episode, or a task
+                # that does not expose one) contributes nothing.
+                n_rows = pre_rows.shape[0]
+                if reward is None:
+                    r_rows = torch.zeros(n_rows, 1, device=W.device)
+                else:
+                    r_rows = reward.detach().to(W.device).reshape(-1, 1)
+                    if r_rows.shape[0] == 1 and n_rows != 1:
+                        # A single shared reward applies to every sample.
+                        r_rows = r_rows.expand(n_rows, 1)
+                    elif r_rows.shape[0] != n_rows:
+                        r_rows = torch.zeros(n_rows, 1, device=W.device)
+                self._reward_window.append(r_rows.clone())
 
         return output
 
@@ -273,6 +335,37 @@ class HanLayer(nn.Module):
                 + self.d_scale * self.D
             )
 
+            if self.lr_reward != 0.0 and len(self._reward_window) > 0:
+                # Three-factor term, per sample and relative to a baseline.
+                #
+                #   mean_s[ (r_s - baseline) * x_s y_s^T ]
+                #
+                # NOT ``mean(r) * mean(x y^T)``: averaging the reward first
+                # mixes the parallel environments, so a collision in one
+                # environment punishes the sensible action taken in another.
+                # The baseline is what makes a negative-dominated reward
+                # (this task's collision penalty swamps everything else)
+                # mean "better than usual" rather than "always decay".
+                reward_stack = torch.stack(
+                    list(self._reward_window), dim=0
+                )                                              # (T, N, 1)
+                window_mean = reward_stack.mean().item()
+                self._reward_baseline = (
+                    self._reward_baseline_momentum * self._reward_baseline
+                    + (1.0 - self._reward_baseline_momentum) * window_mean
+                )
+                # Clipped so one large spike (e.g. the -1 collision
+                # penalty) cannot dominate the whole window.
+                advantage = (reward_stack - self._reward_baseline).clamp(
+                    -self.advantage_clip, self.advantage_clip
+                )
+                reward_outer = (
+                    pre_stack.unsqueeze(-1)
+                    * post_stack.unsqueeze(-2)
+                    * advantage.unsqueeze(-1)
+                ).mean(dim=(0, 1))                             # (in, out)
+                delta_W = delta_W + self.lr_reward * reward_outer
+
             new_W = self.W.data + self.lr_hebb * delta_W
 
             if self.lr_oja > 0.0:
@@ -304,6 +397,7 @@ class HanLayer(nn.Module):
             self._pre_window.clear()
             self._post_window.clear()
             self._post_sq_window.clear()
+            self._reward_window.clear()
 
     def _normalize(self, W: torch.Tensor) -> torch.Tensor:
         """Normalize ``W`` according to ``self.normalization``.
@@ -353,6 +447,12 @@ class HanLayer(nn.Module):
         self._pre_window.clear()
         self._post_window.clear()
         self._post_sq_window.clear()
+        self._reward_window.clear()
+
+    def reset_reward_baseline(self):
+        """Start the reward baseline from zero. Called at the start of each
+        episode so the previous episode's reward level does not leak in."""
+        self._reward_baseline = 0.0
 
     def get_abcd_vector(self) -> torch.Tensor:
         return torch.cat([
@@ -398,6 +498,9 @@ class HanModel(Model):
         stats_mode: str = "per_sample",
         normalization: str = "spectral",
         normalize_stats: bool = True,
+        lr_reward: float = 0.0,
+        modulation_key: str = "reward",
+        advantage_clip: float = 1.0,
         activation_class: Type[nn.Module] = None,
         activation_kwargs: Optional[dict] = None,
         **kwargs,
@@ -413,6 +516,12 @@ class HanModel(Model):
         self.stats_mode = stats_mode
         self.normalization = normalization
         self.normalize_stats = bool(normalize_stats)
+        self.lr_reward = float(lr_reward)
+        # Which per-agent tensordict entry is the third (modulating) factor:
+        # "reward" = the env reward (legacy), "modulation" = a shaped signal
+        # written by the optimizer's rollout loop.
+        self.modulation_key = modulation_key
+        self.advantage_clip = float(advantage_clip)
         self.num_feature_dims = kwargs.pop("num_feature_dims", 1)
 
         super().__init__(
@@ -446,6 +555,8 @@ class HanModel(Model):
             stats_mode=self.stats_mode,
             normalization=self.normalization,
             normalize_stats=self.normalize_stats,
+            lr_reward=self.lr_reward,
+            advantage_clip=self.advantage_clip,
         )
 
         # Two HAN layers: input -> hidden(18) -> output. (Single hidden layer.)
@@ -502,6 +613,18 @@ class HanModel(Model):
             dim=-1,
         )
 
+        # The reward for the action taken from the observation we are about
+        # to act on was produced by the *previous* step and lives under
+        # ``("next", group, "reward")`` — the rollout loop does
+        # ``td = td.get("next")`` after each step, so that reward sits at
+        # ``(group, "reward")`` in the tensordict handed to the policy.
+        # The first step of an episode has no reward yet, which the layer
+        # treats as a zero contribution.
+        reward = None
+        if self.lr_reward != 0.0:
+            reward = tensordict.get((self.agent_group, self.modulation_key),
+                                    None)
+
         if self.input_has_agent_dim and not self.share_params:
             # Each agent has its own layer stack, so agent i's stack must
             # see ONLY agent i's observation slice ``x[..., i, :]``
@@ -516,13 +639,13 @@ class HanModel(Model):
             # The expected output shape is ``(B, N, out)``.
             res = torch.stack(
                 [
-                    self._forward_through_layers(x[..., i, :], layers)
+                    self._forward_through_layers(x[..., i, :], layers, reward)
                     for i, layers in enumerate(self.per_agent_layers)
                 ],
                 dim=-2,
             )
         else:
-            res = self._forward_through_layers(x, self.layers)
+            res = self._forward_through_layers(x, self.layers, reward)
             if self.input_has_agent_dim and not self.output_has_agent_dim:
                 res = res[..., 0, :]
 
@@ -537,13 +660,14 @@ class HanModel(Model):
 
         return tensordict
 
-    def _forward_through_layers(self, x: torch.Tensor, layers) -> torch.Tensor:
+    def _forward_through_layers(self, x: torch.Tensor, layers,
+                                reward: torch.Tensor = None) -> torch.Tensor:
         # Layer 1: input -> hidden (with activation)
-        x = layers[0](x)
+        x = layers[0](x, reward)
         if self.activation is not None:
             x = self.activation(x)
         # Layer 2: hidden -> output (no activation on inference)
-        x = layers[1](x)
+        x = layers[1](x, reward)
         return x
 
     def _maybe_update_weights(self) -> None:
@@ -643,6 +767,7 @@ class HanModel(Model):
         for layer in self.get_all_han_layers():
             layer.reset_weights()
             layer.reset_window()
+            layer.reset_reward_baseline()
         # Reset the tick counter so a new episode begins at ticks=0.
         self.ticks = 0
 
@@ -673,6 +798,13 @@ class HanConfig(ModelConfig):
     # "spectral" (default), "column_maxabs", "column_l2",
     # "max_abs" (legacy), "none".
     normalization: str = "spectral"
+    # Strength of the reward-modulated (three-factor) Hebbian term.
+    # 0 disables it, which is the behaviour before this term existed.
+    lr_reward: float = 0.0
+    # Source of the modulating factor: "reward" or "modulation".
+    modulation_key: str = "reward"
+    # Clip on the per-sample advantage in the reward term.
+    advantage_clip: float = 1.0
     activation_class: Type[nn.Module] = None
     activation_kwargs: Optional[dict] = None
     num_feature_dims: int = 1
